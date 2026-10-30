@@ -1,0 +1,33 @@
+[
+  {
+    "source": "walk2_subject4.npz",
+    "start_frame": 1065,
+    "end_frame": 1245,
+    "source_fps": 30,
+    "arm_correction": "left_from_right_half_cycle"
+  },
+  {
+    "source": "walk1_subject2.npz",
+    "start_frame": 1725,
+    "end_frame": 1845,
+    "source_fps": 30
+  },
+  {
+    "source": "run1_subject5.npz",
+    "start_frame": 1620,
+    "end_frame": 1695,
+    "source_fps": 30
+  },
+  {
+    "source": "run2_subject1.npz",
+    "start_frame": 5565,
+    "end_frame": 5640,
+    "source_fps": 30
+  },
+  {
+    "source": "sprint1_subject2.npz",
+    "start_frame": 5430,
+    "end_frame": 5505,
+    "source_fps": 30
+  }
+]

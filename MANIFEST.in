@@ -1,0 +1,11 @@
+include README.md README.ko.md
+include docs/data.md
+include docs/evaluation.md
+include docs/training.md
+include outputs/prior.pt
+include outputs/reference/library.npz
+include outputs/reference/curation.json
+prune tests
+prune logs
+prune .venv
+global-exclude __pycache__ *.py[cod]
