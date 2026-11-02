@@ -16,41 +16,55 @@ class SprintCfg(G1FlatCfg):
     class control(G1FlatCfg.control):
         decimation = 4  # 200 Hz physics, 50 Hz policy
         action_scale = 0.25
-        clip_actions = 10.0
-        max_latency_steps = 2  # Control ticks; sampled per episode.
+        clip_actions = 2.0
+        # Physical residual bounds, in radians, around the prior/default pose.
+        # Shoulder roll/yaw are outside the ten-joint motion prior.
+        residual_limits = {".*": 0.5, ".*_shoulder_(roll|yaw)_joint": 0.15}
+        max_latency_steps = 0  # Enable latency randomization after basic gait validation.
+
+    class domain_rand(G1FlatCfg.domain_rand):
+        push_robots = False  # Baseline gait learning; mass/friction/noise stay enabled.
+
+    class termination(G1FlatCfg.termination):
+        terminate_on_feet_crossing = True
+        feet_crossing_margin = 0.02  # Left foot at least 2 cm right of right foot.
+        feet_crossing_duration_s = 0.1  # Consecutive control steps; allow brief recovery.
 
     class commands(G1FlatCfg.commands):
-        # Bootstrap with standing + slow walking so the policy sees changing
-        # commands and an active gait prior before any curriculum promotion.
-        # 0.8 m/s covers the first measured walking anchor (0.661 m/s).
-        ranges = [[0.0, 0.8], [0.0, 0.0], [-0.1, 0.1]]
-        limit_ranges = [[0.0, 6.0], [0.0, 0.0], [-0.7, 0.7]]
+        # Moving samples activate the full prior; separate samples train stops.
+        ranges = [[0.4, 0.8], [0.0, 0.0], [0.0, 0.0]]
+        limit_ranges = [[0.0, 6.0], [0.0, 0.0], [0.0, 0.0]]
         standing_fraction = 0.05
         acceleration_limit = 1.0
         curriculum_kind = "rlvrl_grid"
         curriculum_bin_widths = [0.2, 0.2]  # vx (m/s), yaw rate (rad/s)
         curriculum_local_range = [0.2, 0.2]
-        curriculum_thresholds = [0.8, 0.8]  # Unweighted linear/angular kernels.
+        curriculum_thresholds = [0.8, 0.0]  # Forward-only promotion; yaw reward remains active.
         curriculum_increment = 0.2
         curriculum_min_settled_s = 2.0
         curriculum_settle_tolerance = 0.02  # Filtered vx must reach the sampled command.
+        curriculum_progress = {
+            "min_command": 0.2, "min_speed_ratio": 0.5,
+            "max_forward_mae": 0.1, "max_yaw_mae": None,
+        }  # m/s, dimensionless, m/s, rad/s; evaluated after acceleration.
 
     class rewards(G1FlatCfg.rewards):
         soft_dof_pos_limit = 1.0
-        preset = "sprint_run_scales_v1"
-        # RuN Eqs. 9/10: 2 exp(-2 e_v^2), 0.5 exp(-e_yaw^2).
-        tracking_sigma = 0.5
-        tracking_ang_sigma = 1.0
-        # SPRINT Eq.11 stays a sum of ten kernels. Weight 1/10 and sigma
-        # 1/(10*0.6) match RuN Eq.7's peak and local quadratic coefficient
-        # on this subset, not its full-joint aggregate exponential globally.
-        prior_sigma = 1.0 / (10 * 0.6)
+        preset = "sprint_forward_v5"
+        # Unpublished kernel widths are tuned for actual motion tracking.
+        # These are not the authors' settings.
+        tracking_sigma = 0.1
+        tracking_ang_sigma = 0.25
+        # Same ten-joint sum / maximum 3, with a narrower tracking tolerance
+        # to distinguish following the prior from cancelling it to stand still.
+        prior_sigma = 0.03
         min_feet_distance = 0.12
+        signed_feet_distance = True  # Adaptation: penalize reversed left/right foot ordering.
         swing_duty = 0.4
         scales = {
             "tracking_lin_vel": 2.0,
-            "tracking_ang_vel": 0.5,
-            "prior": 0.1,
+            "tracking_ang_vel": 1.0,
+            "prior": 0.3,
             "close_feet": -100.0,
             "air_height": 5.0,
             "low_speed_air": -6.0,
@@ -84,12 +98,15 @@ class SprintPPOCfg(G1FlatCfgPPO):
     class runner(G1FlatCfgPPO.runner):
         experiment_name = "g1_sprint"
         num_steps_per_env = 32
+        log_interval = 1  # Console only; TensorBoard and Viser update every iteration.
 
     class policy(G1FlatCfgPPO.policy):
         actor_hidden_dims = []
         critic_hidden_dims = []
         activation = "elu"
-        init_noise_std = 0.5
+        init_noise_std = 0.3
+        noise_std_range = [0.1, 0.5]  # Applied to the actual rsl-rl distribution.
 
     class algorithm(G1FlatCfgPPO.algorithm):
         learning_rate = 3e-4
+        entropy_coef = 0.001

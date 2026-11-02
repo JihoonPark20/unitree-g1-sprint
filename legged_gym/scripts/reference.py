@@ -13,6 +13,7 @@ import torch
 from legged_gym.envs.g1_sprint.config import SprintCfg
 from legged_gym.paths import DEFAULT_PRIOR, ROOT_DIR
 from legged_gym.sim.mujoco_batch import joint_parameters, load_model
+from legged_gym.utils.camera import ViserCameraControls
 from spectral_prior.reference import ReferenceGenerator
 
 
@@ -131,6 +132,7 @@ class ReferenceViewer:
         self.scene = ViserMujocoScene(self.server, playback.model, num_envs=1)
         self.scene.camera_tracking_enabled = False
         self.scene.site_groups_visible = [False] * 6
+        self.camera = ViserCameraControls(self.server, (0, 0, args.height - 0.3))
         gui = self.server.gui
         gui.add_markdown(
             "## Suspended reference playback\nNo policy or residual actions. Pelvis position and orientation are fixed."
@@ -174,12 +176,6 @@ class ReferenceViewer:
         @self.restart.on_click
         def restart(_):
             self._restart_requested = True
-
-        @self.server.on_client_connect
-        def connect(client):
-            client.camera.up_direction = (0, 0, 1)
-            client.camera.position = (2.5, -3, args.height + 0.5)
-            client.camera.look_at = (0, 0, args.height - 0.3)
 
     @property
     def url(self):

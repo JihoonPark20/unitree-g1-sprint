@@ -46,8 +46,14 @@ def play(args):
         policy = runner.get_inference_policy(device=runner.device)
         env.headless = args.headless
         env.follow_camera = args.camera == "follow"
+        env.camera_azimuth = args.camera_azimuth
+        env.camera_elevation = args.camera_elevation
+        env.camera_distance = args.camera_distance
+        env.camera_height = args.camera_height
         print(f"Checkpoint: {args.checkpoint_path}")
         print(f"Camera: {args.camera}; commands [vx, vy, yaw rate]: {env.commands[0].tolist()}")
+        if not args.headless:
+            print("Camera: drag to orbit/pan, scroll to zoom; F centers on robot, R resets view.")
         obs = env.get_observations()
         total_reward, done_count = 0.0, 0
         with torch.inference_mode():

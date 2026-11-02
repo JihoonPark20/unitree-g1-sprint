@@ -3,6 +3,7 @@
 """Task construction and the rsl-rl runner configuration boundary."""
 
 import json
+import math
 import shutil
 from copy import deepcopy
 from datetime import datetime
@@ -51,12 +52,21 @@ def policy_contract(env):
         "armature": env.cfg.control.armature,
         "frictionloss": env.cfg.control.frictionloss,
     }
+    if getattr(env, "residual_limits", None) is not None:
+        contract["version"] = 3
+        contract["residual_limits_rad"] = env.residual_limits.tolist()
     return contract
 
 
 def runner_config(cfg):
     policy = class_to_dict(cfg.policy)
     algorithm = class_to_dict(cfg.algorithm)
+    std_range = policy.get("noise_std_range", [1e-6, 1e6])
+    if (
+        len(std_range) != 2 or not all(math.isfinite(x) for x in std_range)
+        or not 0 < std_range[0] <= policy["init_noise_std"] <= std_range[1]
+    ):
+        raise ValueError("noise_std_range must be positive, ordered, and contain init_noise_std")
     return {
         "seed": cfg.seed,
         "num_steps_per_env": cfg.runner.num_steps_per_env,
@@ -71,6 +81,7 @@ def runner_config(cfg):
                 "class_name": "rsl_rl.modules:GaussianDistribution",
                 "std_type": "scalar",
                 "init_std": policy["init_noise_std"],
+                "std_range": std_range,
             },
         },
         "critic": {
@@ -86,6 +97,7 @@ def runner_config(cfg):
             **algorithm,
         },
         "logger": "tensorboard",
+        "console_log_interval": getattr(cfg.runner, "log_interval", 1),
         "check_for_nan": True,
     }
 
@@ -165,15 +177,22 @@ class TaskRegistry:
                 legacy_rewards = "tracking_ang_sigma" not in snapshot["env"]["rewards"]
                 if not getattr(args, "play", False) and (
                     snapshot["env"]["commands"].get("curriculum_kind") != "rlvrl_grid"
-                    or snapshot["env"]["rewards"].get("preset") != "sprint_run_scales_v1"
+                    or snapshot["env"]["rewards"].get("preset") != env_cfg.rewards.preset
                 ):
                     raise ValueError(
-                        "This checkpoint predates the RuN-scale rewards / RLvRL grid curriculum. "
+                        "This checkpoint uses an older training preset. "
                         "It can still be played/evaluated, but start a new training run without "
                         "--resume or --checkpoint_path to use the new setup."
                     )
                 update_class_from_dict(env_cfg, snapshot["env"], strict=False)
                 update_class_from_dict(train_cfg, snapshot["train"], strict=False)
+                # Missing snapshot fields must not inherit tighter new defaults:
+                # old checkpoint playback keeps its original action semantics.
+                env_cfg.control.residual_limits = snapshot["env"]["control"].get("residual_limits")
+                env_cfg.commands.curriculum_progress = snapshot["env"]["commands"].get("curriculum_progress")
+                env_cfg.rewards.signed_feet_distance = snapshot["env"]["rewards"].get("signed_feet_distance", False)
+                env_cfg.termination.terminate_on_feet_crossing = snapshot["env"]["termination"].get("terminate_on_feet_crossing", False)
+                train_cfg.policy.noise_std_range = snapshot["train"]["policy"].get("noise_std_range", [1e-6, 1e6])
                 if legacy_rewards:
                     # Old policies used one shared width for both tracking terms.
                     env_cfg.rewards.tracking_ang_sigma = env_cfg.rewards.tracking_sigma
@@ -185,8 +204,9 @@ class TaskRegistry:
             update_cfg_from_args(env_cfg, train_cfg, args)
         env_cfg.seed = train_cfg.seed
         prior = env_cfg.reference.checkpoint
-        if args is not None and getattr(args, "checkpoint_path", None):
-            bundled = Path(args.checkpoint_path).resolve().parent / "spectral_prior.pt"
+        source = None if args is None else (getattr(args, "checkpoint_path", None) or getattr(args, "warm_start", None))
+        if source:
+            bundled = Path(source).resolve().parent / "spectral_prior.pt"
             if bundled.is_file():
                 prior = bundled
         if args is not None and getattr(args, "prior_checkpoint", None):
@@ -247,6 +267,7 @@ class TaskRegistry:
                         "dependencies": {key: version(key) for key in ("rsl-rl-lib", "mujoco", "torch")},
                         "reward_definition": "SPRINT Eq.14 torso bound uses raw commanded vx",
                         "contract": policy_contract(env),
+                        "warm_start_checkpoint": getattr(args, "warm_start", None),
                     },
                     indent=2,
                 )
@@ -255,6 +276,8 @@ class TaskRegistry:
         from legged_gym.runners.on_policy_runner import SprintRunner, sprint_runner_config
 
         runner = SprintRunner(env, sprint_runner_config(train_cfg), log_dir, device=device)
+        if getattr(args, "warm_start", None):
+            runner.warm_start(args.warm_start)
         if getattr(args, "resume", False) or getattr(args, "checkpoint_path", None):
             path = getattr(args, "checkpoint_path", None)
             if path is None:

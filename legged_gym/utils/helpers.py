@@ -115,12 +115,20 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--desired_kl", type=float)
         parser.add_argument("--learning_rate", type=float)
         parser.add_argument("--run_name")
+        parser.add_argument("--log_interval", "--log-interval", type=int, default=1,
+                            help="Terminal progress interval in iterations (default: 1); TensorBoard logs every iteration")
         parser.add_argument("--log-dir", help="Exact new run directory")
         parser.add_argument("--resume", action="store_true")
+        parser.add_argument("--warm_start", "--warm-start", metavar="<model>.pt",
+                            help="Initialize actor weights in a new run; reset critic, optimizer, exploration and curriculum")
     elif mode == "play":
         parser.add_argument("--steps", type=int, default=1000)
         parser.add_argument("--velocity", type=float, nargs=3, metavar=("VX", "VY", "WZ"))
         parser.add_argument("--camera", choices=["follow", "fixed"], default="follow")
+        parser.add_argument("--camera-azimuth", type=float, default=135.0, help="Initial orbit angle in degrees")
+        parser.add_argument("--camera-elevation", type=float, default=-20.0, help="Initial MuJoCo elevation in degrees")
+        parser.add_argument("--camera-distance", type=float, default=3.0, help="Initial camera distance in meters")
+        parser.add_argument("--camera-height", type=float, default=0.0, help="Look-at height relative to the pelvis")
     elif mode == "evaluate":
         parser.add_argument("--speeds", nargs="+", type=float, default=[i / 10 for i in range(61)])
         parser.add_argument("--seconds", type=float, default=20, help="Measurement duration after warmup")
@@ -131,10 +139,12 @@ def get_args(argv=None, *, mode="train"):
     else:
         raise ValueError(f"Unknown mode: {mode}")
     args = parser.parse_args(argv)
+    if getattr(args, "warm_start", None) and (getattr(args, "resume", False) or args.checkpoint_path):
+        parser.error("--warm_start starts a new run and cannot be combined with --resume or --checkpoint_path")
     args.play = mode != "train"
     if args.play:
         args.resume = True
-    for name in ("num_envs", "max_iterations", "torch_threads", "steps"):
+    for name in ("num_envs", "max_iterations", "torch_threads", "steps", "log_interval"):
         value = getattr(args, name, None)
         if value is not None and value <= 0:
             parser.error(f"{name} must be positive")
@@ -144,6 +154,14 @@ def get_args(argv=None, *, mode="train"):
             parser.error(f"{name} must be finite and positive")
     if args.num_threads is not None and args.num_threads < 0:
         parser.error("num_threads must be nonnegative")
+    if mode == "play" and (
+        not all(math.isfinite(v) for v in (
+            args.camera_azimuth, args.camera_elevation, args.camera_distance, args.camera_height
+        ))
+        or args.camera_distance <= 0
+        or not -89 <= args.camera_elevation <= 89
+    ):
+        parser.error("Camera values must be finite, distance positive, and elevation within [-89, 89]")
     if (
         mode == "play"
         and args.velocity
@@ -189,7 +207,7 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
             value = getattr(args, key, None)
             if value is not None:
                 setattr(train_cfg.algorithm, key, value)
-        for key in ("max_iterations", "experiment_name", "run_name"):
+        for key in ("max_iterations", "experiment_name", "run_name", "log_interval"):
             value = getattr(args, key, None)
             if value is not None:
                 setattr(train_cfg.runner, key, value)

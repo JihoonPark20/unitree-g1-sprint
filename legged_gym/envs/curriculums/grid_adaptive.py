@@ -12,25 +12,36 @@ import numpy as np
 
 
 class GridAdaptiveCurriculum:
-    def __init__(self, limits, bin_widths, initial_ranges, thresholds, increment=0.2, local_range=None):
+    def __init__(self, limits, bin_widths, initial_ranges, thresholds, increment=0.2, local_range=None, progress=None):
         self.limits = np.asarray(limits, dtype=float)
         widths = np.asarray(bin_widths, dtype=float)
         initial = np.asarray(initial_ranges, dtype=float)
         self.thresholds = np.asarray(thresholds, dtype=float)
         self.increment = float(increment)
+        self.progress = None if progress is None else dict(progress)
+        if self.progress is not None and (
+            set(self.progress) != {"min_command", "min_speed_ratio", "max_forward_mae", "max_yaw_mae"}
+            or not all(
+                (key == "max_yaw_mae" and value is None) or (value is not None and np.isfinite(value) and value > 0)
+                for key, value in self.progress.items()
+            )
+            or self.progress["min_speed_ratio"] > 1
+        ):
+            raise ValueError("Invalid physical command-progress criteria")
         if (
             self.limits.shape != (2, 2) or widths.shape != (2,) or initial.shape != (2, 2)
             or self.thresholds.shape != (2,)
             or not all(np.isfinite(x).all() for x in (self.limits, widths, initial, self.thresholds))
-            or np.any(widths <= 0) or np.any(np.diff(self.limits, axis=1) <= 0)
+            or np.any(widths <= 0) or np.any(np.diff(self.limits, axis=1) < 0)
+            or not np.any(np.diff(self.limits, axis=1) > 0)
             or np.any(initial[:, 0] > initial[:, 1])
             or np.any(initial[:, 0] < self.limits[:, 0]) or np.any(initial[:, 1] > self.limits[:, 1])
             or np.any((self.thresholds < 0) | (self.thresholds > 1))
             or not 0 < self.increment <= 1
         ):
             raise ValueError("Invalid grid curriculum ranges, widths, thresholds or increment")
-        # Exact partition of the requested limits; no sampled command can leak
-        # beyond 0..6 m/s or +/-0.7 rad/s through half-bin jitter.
+        # Fixed axes have one zero-width cell, so yaw=[0, 0] samples exactly
+        # zero even after expansion. Other axes partition their limits exactly.
         counts = np.maximum(1, np.ceil(np.round(np.diff(self.limits, axis=1).ravel() / widths, 12)).astype(int))
         self.shape = tuple(counts.tolist())
         edges = [np.linspace(lo, hi, n + 1) for (lo, hi), n in zip(self.limits, counts)]
@@ -52,7 +63,7 @@ class GridAdaptiveCurriculum:
         bins = rng.choice(len(self.weights), size=size, p=self.weights / self.weights.sum())
         return rng.uniform(self.low[bins], self.high[bins]), bins
 
-    def update(self, bins, scores, eligible):
+    def update(self, bins, scores, eligible, motion=None):
         """Credit completed command segments; scores are unweighted mean kernels.
 
         Ineligible segments (falls / too little settled time) count as attempts,
@@ -65,6 +76,19 @@ class GridAdaptiveCurriculum:
             raise ValueError("Invalid command-segment scores")
         if np.any((bins < -1) | (bins >= len(self.weights))):
             raise ValueError("Command bin outside curriculum grid")
+        if self.progress is not None:
+            # Settled segment means: command vx, actual signed vx, vx MAE,
+            # yaw MAE. A high kernel score alone can reward standing still.
+            motion = np.asarray(motion, dtype=float)
+            if motion.shape != (len(bins), 4) or not np.isfinite(motion).all():
+                raise ValueError("Progress curriculum requires finite command / motion measurements")
+            command, forward, vx_error, yaw_error = motion.T
+            p = self.progress
+            eligible = eligible & (command >= p["min_command"]) & (
+                forward >= p["min_speed_ratio"] * command
+            ) & (vx_error <= p["max_forward_mae"])
+            if p["max_yaw_mae"] is not None:
+                eligible &= yaw_error <= p["max_yaw_mae"]
         valid = bins >= 0
         bins, scores, eligible = bins[valid], scores[valid], eligible[valid]
         np.add.at(self.trials, bins, 1)
@@ -96,10 +120,13 @@ class GridAdaptiveCurriculum:
         }
 
     def _contract(self):
-        return {
+        contract = {
             "version": 1, "kind": "rlvrl_grid", "limits": self.limits.tolist(), "shape": list(self.shape),
             "thresholds": self.thresholds.tolist(), "increment": self.increment, "local_range": self.local_range.tolist(),
         }
+        if self.progress is not None:
+            contract.update(version=2, progress=self.progress)
+        return contract
 
     def state_dict(self):
         return {

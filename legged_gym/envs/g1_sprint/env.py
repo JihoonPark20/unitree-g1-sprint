@@ -14,6 +14,32 @@ from spectral_prior.reference import ReferenceGenerator
 
 class SprintEnv(SprintRobot):
     def __init__(self, cfg, **kwargs):
+        if (
+            not np.isfinite([cfg.control.action_scale, cfg.control.clip_actions]).all()
+            or cfg.control.action_scale <= 0 or cfg.control.clip_actions <= 0
+        ):
+            raise ValueError("Action scale and action clip must be finite and positive")
+        bounds = getattr(cfg.control, "residual_limits", None)
+        self.residual_limits = None if bounds is None else joint_parameters(cfg.asset.action_joint_names, bounds)
+        if self.residual_limits is not None and np.any(self.residual_limits <= 0):
+            raise ValueError("Residual joint limits must be positive radians")
+        self._terminate_on_feet_crossing = getattr(cfg.termination, "terminate_on_feet_crossing", False)
+        if self._terminate_on_feet_crossing and (
+            not np.isfinite([cfg.termination.feet_crossing_margin, cfg.termination.feet_crossing_duration_s]).all()
+            or cfg.termination.feet_crossing_margin < 0 or cfg.termination.feet_crossing_duration_s <= 0
+        ):
+            raise ValueError("Foot crossing needs a nonnegative margin and positive duration")
+        self._feet_crossing_steps = np.zeros(cfg.env.num_envs, dtype=np.int32)
+        self.feet_crossing_buf = np.zeros(cfg.env.num_envs, dtype=bool)
+        self._command_crossed = np.zeros(cfg.env.num_envs, dtype=bool)
+        self._diagnostic_names = (
+            "Control/residual_rms_rad", "Control/action_clip_fraction", "Control/target_clip_fraction",
+            "Tracking/prior_mae_rad", "Tracking/forward_mae_m_s", "Tracking/yaw_mae_rad_s",
+            "Gait/both_ground_fraction", "Gait/single_support_fraction", "Gait/both_air_fraction",
+            "Gait/signed_foot_separation_m", "Gait/feet_crossed_fraction",
+        )
+        self._diagnostic_sums = np.zeros((cfg.env.num_envs, len(self._diagnostic_names)))
+        self._torque_saturation_sums = np.zeros((cfg.env.num_envs, len(cfg.asset.joint_names)))
         default = joint_parameters(cfg.asset.joint_names, cfg.init_state.default_joint_angles, 0)
         self.reference = ReferenceGenerator(
             cfg.reference.checkpoint, cfg.asset.joint_names, default, cfg.env.num_envs, cfg.reference.blend_speed
@@ -32,6 +58,7 @@ class SprintEnv(SprintRobot):
                 np.asarray(cfg.commands.limit_ranges)[[0, 2]], cfg.commands.curriculum_bin_widths,
                 np.asarray(cfg.commands.ranges)[[0, 2]], cfg.commands.curriculum_thresholds,
                 cfg.commands.curriculum_increment, cfg.commands.curriculum_local_range,
+                progress=getattr(cfg.commands, "curriculum_progress", None),
             )
             if (
                 not np.isfinite([cfg.commands.acceleration_limit, cfg.commands.curriculum_min_settled_s,
@@ -43,6 +70,7 @@ class SprintEnv(SprintRobot):
                 raise ValueError("Curriculum needs positive acceleration and a valid settled measurement window")
         self._command_bins = np.full(cfg.env.num_envs, -1, dtype=int)
         self._command_score_sums = np.zeros((cfg.env.num_envs, 2))
+        self._command_motion_sums = np.zeros((cfg.env.num_envs, 3))
         self._command_settled_steps = np.zeros(cfg.env.num_envs, dtype=int)
         self.record_evaluation = False
         super().__init__(cfg, **kwargs)
@@ -53,12 +81,30 @@ class SprintEnv(SprintRobot):
 
     def reset_idx(self, ids):
         super().reset_idx(ids)
+        self._diagnostic_sums[ids] = 0
+        self._torque_saturation_sums[ids] = 0
+        self._feet_crossing_steps[ids] = 0
+        self.feet_crossing_buf[ids] = False
         self.filtered_speed[ids] = 0
         self.reference.reset(ids)
         self._latency[ids] = self.rng.integers(0, self.cfg.control.max_latency_steps + 1, len(ids))
         self._update_reference()
         self.target_position[ids] = self.q_ref[ids]
         self._targets[:, ids] = self.q_ref[ids]
+
+    def check_termination(self):
+        super().check_termination()
+        if self._terminate_on_feet_crossing:
+            crossed = self._signed_foot_separation() < -self.cfg.termination.feet_crossing_margin
+            self._feet_crossing_steps[:] = np.where(crossed, self._feet_crossing_steps + 1, 0)
+            self._command_crossed |= crossed
+            self.feet_crossing_buf[:] = (
+                self._feet_crossing_steps * self.dt + 1e-12 >= self.cfg.termination.feet_crossing_duration_s
+            )
+            self.terminated_buf |= self.feet_crossing_buf
+            # Crossing is a true failure even when it coincides with a timeout.
+            self.time_out_buf &= ~self.terminated_buf
+            self.reset_buf = self.terminated_buf | self.time_out_buf
 
     def _compute_torques(self, actions):
         # Target is held over decimation; PD feedback is recomputed at 200 Hz.
@@ -76,12 +122,20 @@ class SprintEnv(SprintRobot):
         if actions.shape != self.actions.shape or not np.isfinite(actions).all():
             raise ValueError(f"Expected finite residual actions of shape {self.actions.shape}")
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
+        if self.residual_limits is not None:
+            action_limits = self.residual_limits / self.cfg.control.action_scale
+            self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
+        # Previous-action observations describe the bounded residual actually
+        # requested from PD, while PPO retains its original sampled actions.
+        self._diagnostic_sums[:, 0] += np.sqrt(np.square(self.cfg.control.action_scale * self.actions).mean(1))
+        self._diagnostic_sums[:, 1] += (np.abs(actions - self.actions) > 1e-7).mean(1)
         target = self.q_ref.copy()
         target[:, self.action_dof_indices] += self.cfg.control.action_scale * self.actions
         # Wrist joints remain physical: PD holds a fixed pose under external loads.
         target[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
         # Joint constraints apply to the combined reference+residual, not either separately.
         limits = self.sim.model.jnt_range[self.sim.joint_ids]
+        self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
         self._targets[1:] = self._targets[:-1].copy()
         self._targets[0] = np.clip(target, limits[:, 0], limits[:, 1])
         self.target_position[:] = self._targets[self._latency, np.arange(self.num_envs)]
@@ -90,6 +144,9 @@ class SprintEnv(SprintRobot):
         self._touchdown_air_time.fill(0)
         for substep in range(self.cfg.control.decimation):
             self.torques[:] = self._compute_torques(self.actions)
+            self._torque_saturation_sums += (
+                np.abs(self.torques) >= 0.99 * self.torque_limits
+            ) / self.cfg.control.decimation
             self.sim.step(self.torques, observe=substep == self.cfg.control.decimation - 1)
             self._update_contacts()
         self.common_step_counter += 1
@@ -98,6 +155,7 @@ class SprintEnv(SprintRobot):
         self.check_termination()
         # Evaluate the reference and command that actually produced this transition.
         self.compute_reward()
+        self._record_tracking_diagnostics()
         self._record_command_scores()
         self.last_actions[:] = self.actions
         self.last_dof_vel[:] = self.dof_vel
@@ -113,7 +171,10 @@ class SprintEnv(SprintRobot):
         self.compute_observations()
         dones = torch.from_numpy(self.reset_buf.copy())
         rewards = torch.from_numpy(self.rew_buf.astype(np.float32))
-        extras = {"time_outs": torch.from_numpy(self.time_out_buf.copy())}
+        extras = {
+            "time_outs": torch.from_numpy(self.time_out_buf.copy()),
+            "feet_crossing": torch.from_numpy(self.feet_crossing_buf.copy()),
+        }
         if self.record_evaluation:
             # Snapshot t+dt before auto-reset, aligned with the oscillator at t+dt.
             w, x, y, z = self.base_quat.T
@@ -139,6 +200,7 @@ class SprintEnv(SprintRobot):
         metrics = super()._episode_metrics(ids)
         # Population snapshots, independent of the environment shown in Viser.
         metrics.update({
+            "Episode/feet_crossing_fraction": float(self.feet_crossing_buf[ids].mean()),
             "Commands/mean_vx": float(self.commands[:, 0].mean()),
             "Commands/moving_fraction": float(np.mean(self.commands[:, 0] > 0)),
             "Commands/mean_filtered_vx": float(self.filtered_speed.mean()),
@@ -147,14 +209,38 @@ class SprintEnv(SprintRobot):
         })
         if self.command_curriculum is not None and self.cfg.commands.curriculum:
             metrics.update(self.command_curriculum.metrics())
+        # Normalize by actual episode length, not the nominal timeout, so early
+        # falls cannot hide actuator saturation or tracking errors.
+        lengths = np.maximum(self.episode_length_buf.numpy()[ids, None], 1)
+        means = (self._diagnostic_sums[ids] / lengths).mean(0)
+        metrics.update(dict(zip(self._diagnostic_names, map(float, means))))
+        saturation = (self._torque_saturation_sums[ids] / lengths).mean(0)
+        metrics["Control/torque_saturation"] = float(saturation.mean())
+        metrics.update({f"TorqueSaturation/{name}": float(value) for name, value in zip(self.dof_names, saturation)})
         return metrics
+
+    def _record_tracking_diagnostics(self):
+        indices = self.reference.indices
+        self._diagnostic_sums[:, 3] += np.abs(self.dof_pos[:, indices] - self.q_ref[:, indices]).mean(1)
+        forward = self._forward_velocity()
+        self._diagnostic_sums[:, 4] += np.abs(self.filtered_speed - forward)
+        self._diagnostic_sums[:, 5] += np.abs(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        contacts = self._feet_contact.sum(1)
+        self._diagnostic_sums[:, 6] += contacts == 2
+        self._diagnostic_sums[:, 7] += contacts == 1
+        self._diagnostic_sums[:, 8] += contacts == 0
+        separation = self._signed_foot_separation()
+        self._diagnostic_sums[:, 9] += separation
+        self._diagnostic_sums[:, 10] += separation < 0
 
     def _resample_commands(self, ids):
         if not len(ids):
             return
         self._command_score_sums[ids] = 0
+        self._command_motion_sums[ids] = 0
         self._command_settled_steps[ids] = 0
         self._command_bins[ids] = -1
+        self._command_crossed[ids] = False
         if self.command_curriculum is None or not self.cfg.commands.curriculum:
             # Playback/evaluation use exact externally requested commands.
             return super()._resample_commands(ids)
@@ -177,6 +263,10 @@ class SprintEnv(SprintRobot):
         # Unweighted kernels avoid coupling success thresholds to reward tuning.
         self._command_score_sums[settled, 0] += self._reward_tracking_lin_vel()[settled]
         self._command_score_sums[settled, 1] += self._reward_tracking_ang_vel()[settled]
+        forward = self._forward_velocity()[settled]
+        self._command_motion_sums[settled, 0] += forward
+        self._command_motion_sums[settled, 1] += np.abs(self.commands[settled, 0] - forward)
+        self._command_motion_sums[settled, 2] += np.abs(self.commands[settled, 2] - self.base_ang_vel[settled, 2])
 
     def _finish_command_segments(self, ids):
         if not len(ids) or self.command_curriculum is None or not self.cfg.commands.curriculum:
@@ -184,11 +274,17 @@ class SprintEnv(SprintRobot):
         counts = self._command_settled_steps[ids]
         scores = self._command_score_sums[ids] / np.maximum(counts[:, None], 1)
         eligible = (counts * self.dt + 1e-12 >= self.cfg.commands.curriculum_min_settled_s) & ~self.terminated_buf[ids]
-        self.command_curriculum.update(self._command_bins[ids], scores, eligible)
+        # A crossing near a segment boundary must not promote before the
+        # consecutive-step termination timer has had time to expire.
+        eligible &= ~self._command_crossed[ids]
+        motion = np.column_stack((self.commands[ids, 0], self._command_motion_sums[ids] / np.maximum(counts[:, None], 1)))
+        self.command_curriculum.update(self._command_bins[ids], scores, eligible, motion=motion)
         self.command_ranges[[0, 2]] = self.command_curriculum.active_ranges
         self._command_score_sums[ids] = 0
+        self._command_motion_sums[ids] = 0
         self._command_settled_steps[ids] = 0
         self._command_bins[ids] = -1
+        self._command_crossed[ids] = False
 
     def _observation_terms(self, critic):
         terms = super()._observation_terms(critic)
@@ -200,12 +296,14 @@ class SprintEnv(SprintRobot):
             terms["reference"] = self.q_ref[:, self.reference.indices]
         return terms
 
-    def _reward_tracking_lin_vel(self):
+    def _forward_velocity(self):
         # Heading frame excludes torso pitch from the measured forward speed.
         w, x, y, z = self.base_quat.T
         yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        v = np.cos(yaw) * self.sim.qvel[:, 0] + np.sin(yaw) * self.sim.qvel[:, 1]
-        return np.exp(-np.square(self.filtered_speed - v) / self.cfg.rewards.tracking_sigma)
+        return np.cos(yaw) * self.sim.qvel[:, 0] + np.sin(yaw) * self.sim.qvel[:, 1]
+
+    def _reward_tracking_lin_vel(self):
+        return np.exp(-np.square(self.filtered_speed - self._forward_velocity()) / self.cfg.rewards.tracking_sigma)
 
     def _reward_prior(self):
         ids = self.reference.indices
@@ -214,12 +312,18 @@ class SprintEnv(SprintRobot):
     def _reward_tracking_ang_vel(self):
         return np.exp(-np.square(self.commands[:, 2] - self.base_ang_vel[:, 2]) / self.cfg.rewards.tracking_ang_sigma)
 
-    def _reward_close_feet(self):
+    def _signed_foot_separation(self):
+        # Left-minus-right distance along the robot's heading-frame y axis.
         relative = self.feet_pos[:, 0] - self.feet_pos[:, 1]
         w, x, y, z = self.base_quat.T
         yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        lateral = -np.sin(yaw) * relative[:, 0] + np.cos(yaw) * relative[:, 1]
-        return np.maximum(0, self.cfg.rewards.min_feet_distance - np.abs(lateral))
+        return -np.sin(yaw) * relative[:, 0] + np.cos(yaw) * relative[:, 1]
+
+    def _reward_close_feet(self):
+        separation = self._signed_foot_separation()
+        if not getattr(self.cfg.rewards, "signed_feet_distance", False):
+            separation = np.abs(separation)  # Original paper / legacy checkpoint behavior.
+        return np.maximum(0, self.cfg.rewards.min_feet_distance - separation)
 
     def _reward_air_height(self):
         height = self.feet_pos[:, :, 2] - self.feet_ground_height
@@ -282,18 +386,39 @@ class SprintEnv(SprintRobot):
             # Nonpersistent Batch.get_data copies integration state only.
             # The viewer consumes derived xpos/xquat/geom_xpos, not just qpos.
             mujoco.mj_forward(self._viewer_model, self._viewer_data)
-            self._viewer = mujoco.viewer.launch_passive(self._viewer_model, self._viewer_data)
+            self._camera_request = None
+
+            def camera_key(key):
+                if key in (70, 82):  # GLFW F / R; applied under the viewer lock below.
+                    self._camera_request = key
+
+            self._viewer = mujoco.viewer.launch_passive(
+                self._viewer_model, self._viewer_data, key_callback=camera_key
+            )
+            self._camera_root = self.base_pos[0].copy()
             with self._viewer.lock():
-                self._viewer.cam.distance = 3.0
-                self._viewer.cam.elevation = -20
-                self._viewer.cam.lookat[:] = self.base_pos[0]
+                self._reset_camera()
         if self._viewer.is_running():
             with self._viewer.lock():
                 self.sim.batch.get_data(0, self._viewer_data)
                 mujoco.mj_forward(self._viewer_model, self._viewer_data)
                 if getattr(self, "follow_camera", True):
-                    self._viewer.cam.lookat[:] = self.base_pos[0]
+                    self._viewer.cam.lookat[:] += self.base_pos[0] - self._camera_root
+                self._camera_root = self.base_pos[0].copy()
+                request, self._camera_request = self._camera_request, None
+                if request == 82:
+                    self._reset_camera()
+                elif request == 70:
+                    self._viewer.cam.lookat[:] = self.base_pos[0] + np.array([
+                        0, 0, getattr(self, "camera_height", 0.0)
+                    ])
             self._viewer.sync()
+
+    def _reset_camera(self):
+        self._viewer.cam.distance = getattr(self, "camera_distance", 3.0)
+        self._viewer.cam.azimuth = getattr(self, "camera_azimuth", 135.0)
+        self._viewer.cam.elevation = getattr(self, "camera_elevation", -20.0)
+        self._viewer.cam.lookat[:] = self.base_pos[0] + np.array([0, 0, getattr(self, "camera_height", 0.0)])
 
     def close(self):
         self._foot_quat = None

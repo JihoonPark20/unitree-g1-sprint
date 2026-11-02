@@ -13,6 +13,8 @@ from collections import deque
 import mujoco
 import numpy as np
 
+from legged_gym.utils.camera import ViserCameraControls
+
 
 class TrainingMonitor:
     def __init__(self, env, runner, cfg, *, task):
@@ -35,7 +37,6 @@ class TrainingMonitor:
         self._reward_history = deque(maxlen=cfg.history_points)
         self._velocity_history = deque(maxlen=cfg.history_points)
         self._selected_env = None
-        self._last_root = None
         self._thread = None
         self.server = None
         self._attached = False
@@ -56,14 +57,6 @@ class TrainingMonitor:
             self.scene.site_groups_visible = [False] * 6
             self._make_gui(task, cfg.max_fps)
             self._publish_frame(self._snapshot(0))
-
-            @self.server.on_client_connect
-            def on_connect(client):
-                with self._lock:
-                    root = self._last_root.copy() if self._last_root is not None else np.zeros(3)
-                client.camera.up_direction = (0.0, 0.0, 1.0)
-                client.camera.position = root + np.array([2.5, -3.0, 1.5])
-                client.camera.look_at = root
 
             env.step = self._step
             runner.logger.log = self._log
@@ -87,7 +80,7 @@ class TrainingMonitor:
             f"## {task.upper()} · Live training\nObserving sampled training actions, including exploration."
         )
         self.environment = gui.add_number("Environment", initial_value=0, min=0, max=self.env.num_envs - 1, step=1)
-        self.follow = gui.add_checkbox("Follow robot", initial_value=True)
+        self.camera = ViserCameraControls(self.server, self.env.sim.qpos[0, :3])
         self.freeze = gui.add_checkbox(
             "Freeze view", initial_value=False, hint="Training continues while the view is frozen."
         )
@@ -224,9 +217,6 @@ class TrainingMonitor:
         # Kinematics is sufficient for geometry and avoids another physics step.
         mujoco.mj_kinematics(self.model, self.data)
         root = frame["qpos"][:3].copy()
-        with self._lock:
-            previous = self._last_root
-            self._last_root = root
         if self._selected_env != frame["env"]:
             self._velocity_history.clear()
             self._selected_env = frame["env"]
@@ -242,13 +232,9 @@ class TrainingMonitor:
                 frame["velocity"][2],
             )
         )
+        self.camera.update_root(root)
         with self.server.atomic():
             self.scene.update_from_mjdata(self.data)
-            if previous is not None and self.follow.value:
-                delta = root - previous
-                for client in self.server.get_clients().values():
-                    client.camera.position = np.asarray(client.camera.position) + delta
-                    client.camera.look_at = np.asarray(client.camera.look_at) + delta
             command, velocity = frame["command"], frame["velocity"]
             contacts = " / ".join("contact" if value else "air" for value in frame["contacts"])
             self.motion.content = (

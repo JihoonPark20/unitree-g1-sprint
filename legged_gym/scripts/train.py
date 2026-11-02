@@ -14,15 +14,12 @@ def train(args):
     monitor = None
     try:
         runner, cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
+        if getattr(args, "warm_start", None):
+            print(f"Actor initialized from {args.warm_start}; critic, optimizer, exploration and curriculum start fresh")
         print(f"MuJoCo CPU: {env.num_envs} envs / {env.sim.batch.nthread} workers; PPO: {runner.device}")
-        print(f"Control: {env.num_actions} policy actions / {env.num_dof} joints; six wrists held at default PD targets")
         print(
-            f"Rewards: {env.cfg.rewards.preset}; curriculum: {env.cfg.commands.curriculum_kind}; "
+            f"Preset: {env.cfg.rewards.preset}; "
             f"active vx={env.command_ranges[0].tolist()}, yaw={env.command_ranges[2].tolist()}"
-        )
-        print(
-            f"PPO settings: max_grad_norm={runner.alg.max_grad_norm:g}, "
-            f"desired_kl={runner.alg.desired_kl:g}, learning_rate={runner.alg.learning_rate:g}"
         )
         print(f"Logs: {runner.logger.log_dir}")
         if cfg.viewer.enabled and not args.headless:
@@ -42,6 +39,7 @@ def train(args):
             num_learning_iterations=cfg.runner.max_iterations,
             init_at_random_ep_len=False,
         )
+        print(f"Checkpoint: {runner.logger.log_dir}/model_{runner.current_learning_iteration}.pt")
     finally:
         if monitor is not None:
             monitor.close()
