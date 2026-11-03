@@ -17,10 +17,7 @@ def train(args):
         if getattr(args, "warm_start", None):
             print(f"Actor initialized from {args.warm_start}; critic, optimizer, exploration and curriculum start fresh")
         print(f"MuJoCo CPU: {env.num_envs} envs / {env.sim.batch.nthread} workers; PPO: {runner.device}")
-        print(
-            f"Preset: {env.cfg.rewards.preset}; "
-            f"active vx={env.command_ranges[0].tolist()}, yaw={env.command_ranges[2].tolist()}"
-        )
+        print(f"Commands: vx={env.command_ranges[0].tolist()}, yaw={env.command_ranges[2].tolist()}")
         print(f"Logs: {runner.logger.log_dir}")
         if cfg.viewer.enabled and not args.headless:
             try:

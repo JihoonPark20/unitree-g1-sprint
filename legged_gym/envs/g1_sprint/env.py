@@ -327,10 +327,18 @@ class SprintEnv(SprintRobot):
 
     def _reward_air_height(self):
         height = self.feet_pos[:, :, 2] - self.feet_ground_height
-        return (
+        reward = (
             (~self._feet_contact)
             * np.exp(-np.abs(height - self.cfg.rewards.feet_clearance_target) / self.cfg.rewards.feet_clearance_std)
         ).sum(1)
+        if getattr(self.cfg.rewards, "air_height_command_gate", False):
+            # Match the reference blend during acceleration/deceleration.
+            # A zero forward command can still request lateral motion/turning.
+            blend = np.clip(np.abs(self.filtered_speed) / self.cfg.reference.blend_speed, 0.0, 1.0)
+            blend = np.square(blend) * (3.0 - 2.0 * blend)
+            blend[np.any(np.abs(self.commands[:, 1:]) > 1e-6, axis=1)] = 1.0
+            reward *= blend
+        return reward
 
     def _reward_low_speed_air(self):
         return (self.filtered_speed < 1.5) * (~self._feet_contact).all(1)
@@ -359,14 +367,13 @@ class SprintEnv(SprintRobot):
 
     def training_state_dict(self):
         state = super().training_state_dict()
-        state["reward_preset"] = self.cfg.rewards.preset
         state["sprint_curriculum"] = self.command_curriculum.state_dict() if self.command_curriculum is not None else None
         state["command_rng_state"] = self.rng.bit_generator.state
         return state
 
     def load_training_state_dict(self, state):
-        if state.get("reward_preset") != self.cfg.rewards.preset or state.get("sprint_curriculum") is None:
-            raise ValueError("Legacy reward/curriculum checkpoint cannot resume this setup; start a new training run")
+        if state.get("sprint_curriculum") is None:
+            raise ValueError("Checkpoint has no SPRINT curriculum state; start a new training run")
         if self.command_curriculum is None:
             raise ValueError("Cannot restore training curriculum into an evaluation environment")
         self.command_curriculum.load_state_dict(state["sprint_curriculum"])

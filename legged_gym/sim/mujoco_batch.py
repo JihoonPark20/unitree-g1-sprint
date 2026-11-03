@@ -41,6 +41,17 @@ def load_model(cfg, *, fixed_base_height=None):
     for tag in ("sensor", "actuator", "keyframe"):
         for element in root.findall(tag):
             root.remove(element)
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(root, "asset")
+    ET.SubElement(
+        asset, "texture", name="floor_checker", type="2d", builtin="checker",
+        rgb1="0.2 0.3 0.4", rgb2="0.1 0.2 0.3", width="512", height="512",
+    )
+    ET.SubElement(
+        asset, "material", name="floor_material", texture="floor_checker",
+        texuniform="true", texrepeat="1 1", reflectance="0.1",
+    )
     world = root.find("worldbody")
     ET.SubElement(
         world,
@@ -49,7 +60,7 @@ def load_model(cfg, *, fixed_base_height=None):
         type="plane",
         size="0 0 0.1",
         friction="1 0.005 0.0001",
-        rgba="0.25 0.3 0.35 1",
+        material="floor_material",
         condim="3",
     )
     ET.SubElement(world, "light", name="task_light", pos="0 0 4", dir="0 0 -1", directional="true")

@@ -175,14 +175,13 @@ class TaskRegistry:
                         "Start a new training run without --resume or --checkpoint_path."
                     )
                 legacy_rewards = "tracking_ang_sigma" not in snapshot["env"]["rewards"]
-                if not getattr(args, "play", False) and (
-                    snapshot["env"]["commands"].get("curriculum_kind") != "rlvrl_grid"
-                    or snapshot["env"]["rewards"].get("preset") != env_cfg.rewards.preset
+                if (
+                    not getattr(args, "play", False)
+                    and snapshot["env"]["commands"].get("curriculum_kind") != "rlvrl_grid"
                 ):
                     raise ValueError(
-                        "This checkpoint uses an older training preset. "
-                        "It can still be played/evaluated, but start a new training run without "
-                        "--resume or --checkpoint_path to use the new setup."
+                        "Checkpoint does not use the supported RLvRL grid curriculum. "
+                        "Use playback/evaluation or start a new training run."
                     )
                 update_class_from_dict(env_cfg, snapshot["env"], strict=False)
                 update_class_from_dict(train_cfg, snapshot["train"], strict=False)
@@ -191,12 +190,12 @@ class TaskRegistry:
                 env_cfg.control.residual_limits = snapshot["env"]["control"].get("residual_limits")
                 env_cfg.commands.curriculum_progress = snapshot["env"]["commands"].get("curriculum_progress")
                 env_cfg.rewards.signed_feet_distance = snapshot["env"]["rewards"].get("signed_feet_distance", False)
+                env_cfg.rewards.air_height_command_gate = snapshot["env"]["rewards"].get("air_height_command_gate", False)
                 env_cfg.termination.terminate_on_feet_crossing = snapshot["env"]["termination"].get("terminate_on_feet_crossing", False)
                 train_cfg.policy.noise_std_range = snapshot["train"]["policy"].get("noise_std_range", [1e-6, 1e6])
                 if legacy_rewards:
                     # Old policies used one shared width for both tracking terms.
                     env_cfg.rewards.tracking_ang_sigma = env_cfg.rewards.tracking_sigma
-                    env_cfg.rewards.preset = "legacy_checkpoint"
                 train_cfg.runner.experiment_name = name
             else:
                 raise ValueError("Checkpoint requires adjacent run_config.json")

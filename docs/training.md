@@ -4,11 +4,11 @@
 sprint-train --rl_device auto --num_envs 4096 --num_threads 10
 ```
 
-Edit [SPRINT configuration](../legged_gym/envs/g1_sprint/config.py) before starting a new run. Checkpoints retain their configuration and curriculum for `--resume`; incompatible configurations require a new run. Use TensorBoard (`tensorboard --logdir logs`) to inspect rewards, commands and curriculum progress.
+Edit [SPRINT configuration](../legged_gym/envs/g1_sprint/config.py) before starting a new run. `--resume` restores the checkpoint's saved configuration and curriculum, including its original rewards; local reward edits apply to new runs or `--warm_start`. Use TensorBoard (`tensorboard --logdir logs`) to inspect rewards, commands and curriculum progress.
 
 The terminal uses the standard rsl_rl layout **every iteration**, including on resume: throughput, losses, learning rate, mean reward, episode length (steps), action standard deviation, all reward terms, curriculum speed and timing. Iteration numbers match TensorBoard and checkpoint indices. Use `--log_interval 10` for less frequent output. TensorBoard retains all metrics every iteration, including tracking and per-joint diagnostics; its Text tab contains model structure and settings. The Viser monitor also updates every iteration.
 
-Default preset: **`sprint_forward_v5`**, forward-only training with foot-crossing prevention. Start from scratch with the command above; older models remain playable but cannot resume into this preset.
+Training uses forward commands with foot-crossing prevention. Reward changes require a new run or `--warm_start`; older models remain playable with their saved settings.
 
 - Exploration: initial action standard deviation **0.3**, bounded to **0.1–0.5** after every optimizer step; PPO entropy coefficient **0.001**.
 - Residual targets: **±0.5 rad**, narrowed to **±0.15 rad** for shoulder roll/yaw. Wrists retain fixed PD targets.
@@ -36,7 +36,9 @@ sprint-train --warm_start "<model>.pt" --rl_device auto --num_envs 4096 --num_th
 
 These are tuning defaults, not the SPRINT authors’ unpublished settings or RuN’s exact reward function. Long-run convergence remains to be validated.
 
-**Foot-crossing adaptation:** the close-feet term uses `max(0, 0.12 - d_y)` with weight −100, where `d_y` is left-minus-right foot separation along the robot's heading-frame y axis. Unlike the paper's absolute distance, this also penalizes reversed foot ordering. The other reward definitions and all 18 weights are unchanged from the forward-only preset.
+**Foot-crossing adaptation:** the close-feet term uses `max(0, 0.12 - d_y)` with weight −100, where `d_y` is left-minus-right foot separation along the robot's heading-frame y axis. Unlike the paper's absolute distance, this also penalizes reversed foot ordering. All 18 reward weights are retained.
+
+**Standing adaptation:** `air_height_command_gate` fades the foot-lift reward with the prior's speed blend: zero at rest and full strength from 0.4 m/s. Lateral or yaw commands retain the reward for stepping. This command condition is an addition to the paper's reward definition; existing checkpoints retain their original behavior.
 
 An episode terminates if `d_y < −0.02 m` persists for **0.10 s** (five consecutive control steps). A brief crossing can recover, but any command segment crossing that margin cannot promote the curriculum. This is a true failure, including at a time limit; PPO does not bootstrap it as a timeout. These are implementation additions, not claims about the paper's termination rules. No hip joint is locked.
 
@@ -51,7 +53,7 @@ The [RLvRL-based curriculum](../legged_gym/envs/curriculums/grid_adaptive.py) ex
 - A physical-progress gate additionally requires command speed ≥0.2 m/s, mean signed forward speed ≥50% of the command and forward MAE ≤0.1 m/s over the settled samples. This project-specific addition prevents standing from unlocking neighboring cells.
 - Successful cells and their immediate forward neighbors gain 0.2 sampling weight, capped at 1. Previously learned cells remain available.
 
-Yaw tracking reward remains active at a zero target, with its weight and kernel unchanged. Yaw score/error do not gate forward promotion in this experiment. Zero yaw command does not physically lock rotation: inspect yaw error and trajectory heading alongside speed, because forward velocity is measured in the robot's heading frame. This preset does not train turning or backward locomotion. The prior takes phase and speed-derived frequency, not a turn command.
+Yaw tracking reward remains active at a zero target, with its weight and kernel unchanged. Yaw score/error do not gate forward promotion in this experiment. Zero yaw command does not physically lock rotation: inspect yaw error and trajectory heading alongside speed, because forward velocity is measured in the robot's heading frame. This configuration does not train turning or backward locomotion. The prior takes phase and speed-derived frequency, not a turn command.
 
 `Commands/*` shows command distribution and prior activation; `Curriculum/*` shows coverage and tracking success. If expansion stalls, inspect tracking scores, episode duration and reward contributions. A wider command range alone does not demonstrate successful locomotion.
 

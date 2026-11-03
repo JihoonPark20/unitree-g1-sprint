@@ -50,7 +50,9 @@ class SprintCfg(G1FlatCfg):
 
     class rewards(G1FlatCfg.rewards):
         soft_dof_pos_limit = 1.0
-        preset = "sprint_forward_v5"
+        # Do not reward foot lifting while commanded to stand. Reuse the
+        # prior's smooth speed blend; lateral/turn commands still allow steps.
+        air_height_command_gate = True
         # Unpublished kernel widths are tuned for actual motion tracking.
         # These are not the authors' settings.
         tracking_sigma = 0.1
