@@ -77,7 +77,7 @@ def extract_cycle(q, fps, frequency, samples=120):
     return cycle, float(1 / periods[i]), int(peaks[i]), int(peaks[i + 1]), float(errors.mean())
 
 
-def normalize_reference(q, fps, *, arm_correction=None):
+def normalize_reference(q, fps, *, arm_correction=None, lower_body_cycle=None):
     """Stage I: one measured cycle -> 10 s at 30 Hz -> Fourier 60 Hz -> SG -> PSD.
 
     Repetition preserves physical cadence. Peak spacing selects the cycle but
@@ -90,6 +90,28 @@ def normalize_reference(q, fps, *, arm_correction=None):
     _, peak_frequency, a, b, error = extract_cycle(q, fps, preliminary)
     raw_cycle = q[a:b].copy()
     corrections = []
+    if lower_body_cycle is not None:
+        donor = np.asarray(lower_body_cycle, dtype=float)
+        if donor.ndim != 2 or donor.shape[1] != len(JOINT_NAMES) or len(donor) < 4 or not np.isfinite(donor).all():
+            raise ValueError("Lower-body donor must be a finite native cycle in canonical joint order")
+        legs = [
+            JOINT_NAMES.index(f"{side}_{joint}_joint")
+            for side in ("left", "right") for joint in ("hip_pitch", "knee", "ankle_pitch")
+        ]
+        # Both cycles start at a left-hip extension peak. Transfer all six
+        # sagittal leg joints together, preserving donor coordination while
+        # retaining the recipient's physical period and original arm motion.
+        raw_cycle[:, legs] = resample(donor[:, legs], len(raw_cycle), axis=0)
+        corrections.append({
+            "method": "phase_resampled_lower_body",
+            "target_joints": [JOINT_NAMES[i] for i in legs],
+            "donor_cycle_frames": len(donor),
+            "recipient_cycle_frames": len(raw_cycle),
+            "phase_alignment": "left hip pitch peak in both native cycles",
+            "stage": "after original cycle selection, before repetition/resampling/filtering",
+            "speed_label_origin": "recipient source window; not remeasured from the synthesized gait",
+            "reason": "User-requested stable running template transfer; not original GMR lower-body data",
+        })
     if arm_correction is not None:
         if arm_correction != "left_from_right_half_cycle":
             raise ValueError(f"Unknown arm correction: {arm_correction}")
@@ -182,18 +204,43 @@ def build_library(input_dir, output_dir, targets=PAPER_SPEEDS, selections=None):
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     candidates = []
+
+    def source_metadata(path):
+        with np.load(path, allow_pickle=False) as source:
+            return json.loads(source["metadata_json"].item()) if "metadata_json" in source else {}
+
+    def load_selection(item):
+        path = Path(item["source"])
+        if not path.is_absolute():
+            path = Path(input_dir) / path
+        fps, q, forward, _, _ = load_motion(path)
+        if not np.isclose(item.get("source_fps", fps), fps) or not np.isclose(fps, 30):
+            raise ValueError("Selection and source must both use native 30 Hz frame indices")
+        start, end = int(item["start_frame"]), int(item["end_frame"])
+        if not 0 <= start < end <= len(q):
+            raise ValueError("Invalid manual frame range")
+        return path, fps, q[start:end], forward[start:end], start, end
+
     if selections:
         for item in json.loads(Path(selections).read_text()):
-            path = Path(item["source"])
-            if not path.is_absolute():
-                path = Path(input_dir) / path
-            fps, q, forward, _, _ = load_motion(path)
-            if not np.isclose(item.get("source_fps", fps), fps):
-                raise ValueError("Selection frame rate differs from the source motion")
-            start, end = int(item["start_frame"]), int(item["end_frame"])
-            if not 0 <= start < end <= len(q):
-                raise ValueError("Invalid manual frame range")
-            reference = normalize_reference(q[start:end], fps, arm_correction=item.get("arm_correction"))
+            path, fps, q, forward, start, end = load_selection(item)
+            donor_cycle, donor_metadata = None, None
+            if "lower_body_reference" in item:
+                donor = item["lower_body_reference"]
+                dp, dfps, dq, _, ds, de = load_selection(donor)
+                frequency, *_ = spectral_frequency(dq, dfps)
+                _, _, da, db, _ = extract_cycle(dq, dfps, frequency)
+                donor_cycle = dq[da:db]
+                donor_metadata = dict(
+                    source=str(dp.resolve()), sha256=sha256(dp), source_metadata=source_metadata(dp),
+                    source_fps=dfps, start_frame=ds, end_frame=de,
+                    cycle_start_frame=ds + da, cycle_end_frame=ds + db,
+                )
+            reference = normalize_reference(
+                q, fps, arm_correction=item.get("arm_correction"), lower_body_cycle=donor_cycle,
+            )
+            if donor_metadata is not None:
+                reference["corrections"][0]["donor"] = donor_metadata
             candidates.append(
                 dict(
                     source=str(path.resolve()),
@@ -202,7 +249,7 @@ def build_library(input_dir, output_dir, targets=PAPER_SPEEDS, selections=None):
                     cycle_start_frame=start + reference.pop("cycle_start"),
                     cycle_end_frame=start + reference.pop("cycle_end"),
                     source_fps=fps,
-                    speed=float(forward[start:end].mean()),
+                    speed=float(forward.mean()),
                     quality=reference["cycle_mse"],
                     **reference,
                 )
@@ -249,12 +296,14 @@ def build_library(input_dir, output_dir, targets=PAPER_SPEEDS, selections=None):
     times = np.arange(600) / 60
     phases = times[None, :] * frequencies[:, None] % 1
     trajectories = [c["trajectory"] for c in selected]
+    correction_methods = {edit["method"] for c in selected for edit in c.get("corrections", [])}
+    preprocessing_version = 4 if "phase_resampled_lower_body" in correction_methods else 3 if correction_methods else 2
     np.savez_compressed(
         output / "library.npz",
         joint_names=np.array(JOINT_NAMES),
         fps=60,
         source_fps=30,
-        preprocessing_version=3 if any(c.get("corrections") for c in selected) else 2,
+        preprocessing_version=preprocessing_version,
         phase=phases.astype(np.float32),
         joint_pos=np.array(trajectories, dtype=np.float32),
         cycles=np.stack([c["cycle"] for c in selected]).astype(np.float32),
@@ -264,10 +313,6 @@ def build_library(input_dir, output_dir, targets=PAPER_SPEEDS, selections=None):
 
     def clean(c):
         return {k: v for k, v in c.items() if k not in ("cycle", "trajectory", "psd_bins", "psd")}
-
-    def source_metadata(c):
-        with np.load(c["source"], allow_pickle=False) as source:
-            return json.loads(source["metadata_json"].item()) if "metadata_json" in source else {}
 
     report = {
         "version": 2,
@@ -292,7 +337,7 @@ def build_library(input_dir, output_dir, targets=PAPER_SPEEDS, selections=None):
         ),
         "author_reference_identity_verified": False,
         "selected": [
-            {**clean(c), "sha256": sha256(c["source"]), "source_metadata": source_metadata(c)} for c in selected
+            {**clean(c), "sha256": sha256(c["source"]), "source_metadata": source_metadata(c["source"])} for c in selected
         ],
         "candidate_count": len(candidates),
         "selection_targets": list(targets),

@@ -22,7 +22,13 @@
     "source": "run2_subject1.npz",
     "start_frame": 5565,
     "end_frame": 5640,
-    "source_fps": 30
+    "source_fps": 30,
+    "lower_body_reference": {
+      "source": "sprint1_subject2.npz",
+      "start_frame": 5430,
+      "end_frame": 5505,
+      "source_fps": 30
+    }
   },
   {
     "source": "sprint1_subject2.npz",

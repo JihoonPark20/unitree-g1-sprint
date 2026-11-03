@@ -45,11 +45,14 @@ class SprintEnv(SprintRobot):
             cfg.reference.checkpoint, cfg.asset.joint_names, default, cfg.env.num_envs, cfg.reference.blend_speed
         )
         self.q_ref = np.tile(default, (cfg.env.num_envs, 1))
+        self.dq_ref = np.zeros_like(self.q_ref)
         self.frequency = np.full(cfg.env.num_envs, 0.6)
         self.filtered_speed = np.zeros(cfg.env.num_envs)
         self.target_position = self.q_ref.copy()
+        self.target_velocity = np.zeros_like(self.q_ref)
         self._latency = np.zeros(cfg.env.num_envs, dtype=int)
         self._targets = np.tile(self.q_ref, (cfg.control.max_latency_steps + 1, 1, 1))
+        self._target_velocities = np.zeros_like(self._targets)
         self.command_curriculum = None
         if cfg.commands.curriculum:
             if cfg.commands.curriculum_kind != "rlvrl_grid":
@@ -77,7 +80,13 @@ class SprintEnv(SprintRobot):
         self._foot_quat = self.sim.batch.bind("xquat")
 
     def _update_reference(self):
-        self.q_ref[:], self.frequency[:] = self.reference.evaluate(self.filtered_speed)
+        if getattr(self.cfg.control, "reference_velocity", False):
+            self.q_ref[:], self.dq_ref[:], self.frequency[:] = self.reference.evaluate_with_velocity(
+                self.filtered_speed, self.cfg.sim.dt,
+            )
+        else:
+            self.q_ref[:], self.frequency[:] = self.reference.evaluate(self.filtered_speed)
+            self.dq_ref.fill(0)
 
     def reset_idx(self, ids):
         super().reset_idx(ids)
@@ -91,6 +100,8 @@ class SprintEnv(SprintRobot):
         self._update_reference()
         self.target_position[ids] = self.q_ref[ids]
         self._targets[:, ids] = self.q_ref[ids]
+        self.target_velocity[ids] = 0
+        self._target_velocities[:, ids] = 0
 
     def check_termination(self):
         super().check_termination()
@@ -110,7 +121,7 @@ class SprintEnv(SprintRobot):
         # Target is held over decimation; PD feedback is recomputed at 200 Hz.
         pos = self.sim.qpos[:, self.sim.qpos_ids]
         vel = self.sim.qvel[:, self.sim.qvel_ids]
-        torque = self.p_gains * (self.target_position - pos) - self.d_gains * vel
+        torque = self.p_gains * (self.target_position - pos) + self.d_gains * (self.target_velocity - vel)
         return np.clip(torque, -self.torque_limits, self.torque_limits)
 
     def step(self, actions):
@@ -138,7 +149,13 @@ class SprintEnv(SprintRobot):
         self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
         self._targets[1:] = self._targets[:-1].copy()
         self._targets[0] = np.clip(target, limits[:, 0], limits[:, 1])
+        velocity = self.dq_ref.copy()
+        velocity[:, self.held_dof_indices] = 0
+        velocity[((target <= limits[:, 0]) & (velocity < 0)) | ((target >= limits[:, 1]) & (velocity > 0))] = 0
+        self._target_velocities[1:] = self._target_velocities[:-1].copy()
+        self._target_velocities[0] = velocity
         self.target_position[:] = self._targets[self._latency, np.arange(self.num_envs)]
+        self.target_velocity[:] = self._target_velocities[self._latency, np.arange(self.num_envs)]
         self._push_robots()
         self._first_contact.fill(False)
         self._touchdown_air_time.fill(0)

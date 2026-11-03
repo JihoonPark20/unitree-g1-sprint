@@ -329,12 +329,113 @@
       "source_fps": 30.0,
       "speed": 2.8606515521225657,
       "quality": 0.025250459513051694,
-      "frequency": 1.3636366126928512,
-      "fft_frequency": 1.3636366126928512,
+      "frequency": 1.363637450400828,
+      "fft_frequency": 1.363637450400828,
       "peak_frequency": 1.3636363636363638,
-      "spectral_concentration": 0.9994804735126861,
+      "spectral_concentration": 0.9994782989263005,
       "cycle_mse": 0.025250459513051694,
-      "corrections": [],
+      "corrections": [
+        {
+          "method": "phase_resampled_lower_body",
+          "target_joints": [
+            "left_hip_pitch_joint",
+            "left_knee_joint",
+            "left_ankle_pitch_joint",
+            "right_hip_pitch_joint",
+            "right_knee_joint",
+            "right_ankle_pitch_joint"
+          ],
+          "donor_cycle_frames": 19,
+          "recipient_cycle_frames": 22,
+          "phase_alignment": "left hip pitch peak in both native cycles",
+          "stage": "after original cycle selection, before repetition/resampling/filtering",
+          "speed_label_origin": "recipient source window; not remeasured from the synthesized gait",
+          "reason": "User-requested stable running template transfer; not original GMR lower-body data",
+          "donor": {
+            "source": "/private/tmp/sprint-gmr-30hz/sprint1_subject2.npz",
+            "sha256": "4293b22f7bf3d3a2a33217dc1e1f32f8c31d46b0361c63917cd00b44cb3f2722",
+            "source_metadata": {
+              "angle_unit": "rad",
+              "body_layout": "MuJoCo body IDs including world at index 0",
+              "body_reference": "body origin (XBODY)",
+              "ground_adjustment": "none",
+              "joint_layout": "target model hinge-joint order; source mapped by name",
+              "length_unit": "m",
+              "loop": false,
+              "output_fps": 30,
+              "provenance": {
+                "converter_source_sha256": "0d94fff356d0dc21d62b6987b315ae58302042201c644c85788d32042cf9284d",
+                "gmr_patch_sha256": "3548041e146739841470cd6b2110b15197b9812faa9a2e094d19b09a53dd6272",
+                "lafan1": {
+                  "archive": "lafan1/lafan1.zip",
+                  "archive_sha256": "ea918082b500a5d158e9d3aa39039df04cd42e25f5c02fe8f7e88e8e9365a977",
+                  "commit": "94084601bacdf9cc3764b5c73daaeccae6035fac",
+                  "directory": "third_party/lafan1",
+                  "url": "https://github.com/ubisoft/ubisoft-laforge-animation-dataset.git"
+                },
+                "machine": "arm64",
+                "python": "3.12.4",
+                "retarget_device": "cpu",
+                "source_bvh": {
+                  "category": "sprint",
+                  "fps": 30,
+                  "frames": 8194,
+                  "name": "sprint1_subject2.bvh",
+                  "sha256": "441c2d5a2ecbfd14e925023a08071234c4db1c1149f87baea9b44bf825735c68"
+                },
+                "upstream": {
+                  "gmr": {
+                    "commit": "25f56db79ac411258b377b6d4ccba0c8ff3372ac",
+                    "directory": "third_party/GMR",
+                    "patch": "patches/gmr-macos.patch",
+                    "url": "https://github.com/YanjieZe/GMR.git"
+                  },
+                  "lafan1": {
+                    "archive": "lafan1/lafan1.zip",
+                    "archive_sha256": "ea918082b500a5d158e9d3aa39039df04cd42e25f5c02fe8f7e88e8e9365a977",
+                    "commit": "94084601bacdf9cc3764b5c73daaeccae6035fac",
+                    "directory": "third_party/lafan1",
+                    "url": "https://github.com/ubisoft/ubisoft-laforge-animation-dataset.git"
+                  },
+                  "unilab_reference": {
+                    "commit": "68076b1e5c63d36aa2b8930763f9818ccb886510",
+                    "loader": "src/unilab/tasks/motion_tracking/common/motion_loader.py",
+                    "robot": "src/unilab/assets/robots/g1/g1.xml"
+                  }
+                },
+                "versions": {
+                  "daqp": "0.10.3",
+                  "general-motion-retargeting": "0.2.0",
+                  "mink": "1.3.0",
+                  "mujoco": "3.17.0",
+                  "numpy": "2.5.4",
+                  "scipy": "1.18.1",
+                  "torch": "2.14.1"
+                }
+              },
+              "purpose": "AMP/motion-prior source states",
+              "quaternion_order": "wxyz",
+              "resampling": "linear position/joint; shortest-arc SLERP; uniform output timestamps",
+              "retarget_height_assumption_m": 1.75,
+              "schema_version": 1,
+              "source_fps": 30.0,
+              "source_frames": 8194,
+              "source_pickle_sha256": "84b329483722fa7d7c5c53dd2324f9a41c09110239854e30e66d8f81896ce920",
+              "source_quaternion_order": "xyzw",
+              "target_xml": "/Users/jihoon/Workspace/Unilab-G1/UniLab/src/unilab/assets/robots/g1/g1.xml",
+              "target_xml_sha256": "bb6089243f8fe1c97a6410ccde8754eaa58e5d8e476aca69d790ce501cb4a48e",
+              "up_axis": "Z",
+              "velocity_frame": "world",
+              "velocity_method": "mj_differentiatePos centered; angular tangent transported to current root; one-sided endpoints; XBODY sensors"
+            },
+            "source_fps": 30.0,
+            "start_frame": 5430,
+            "end_frame": 5505,
+            "cycle_start_frame": 5457,
+            "cycle_end_frame": 5476
+          }
+        }
+      ],
       "sha256": "55ba1371649e9c04f9a4ca85930a52fbe5952506e9fca823641bb7edb9f92d56",
       "source_metadata": {
         "angle_unit": "rad",
@@ -525,7 +626,7 @@
     0.6122237032194036,
     0.8571387128098444,
     1.2499946819463401,
-    1.3636366126928512,
+    1.363637450400828,
     1.578948163807871,
     2.3
   ]

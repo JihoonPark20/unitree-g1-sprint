@@ -12,6 +12,7 @@ Training uses forward commands with foot-crossing prevention. Reward changes req
 
 - Exploration: initial action standard deviation **0.3**, bounded to **0.1–0.5** after every optimizer step; PPO entropy coefficient **0.001**.
 - Residual targets: **±0.5 rad**, narrowed to **±0.15 rad** for shoulder roll/yaw. Wrists retain fixed PD targets.
+- PD uses reference phase velocity (`reference_velocity`) with the configured gains; residuals remain position offsets. Targets update at 50 Hz and feedback at 200 Hz in training and reference playback. This is an implementation choice; SPRINT does not publish PD gains or a velocity-target rule. Changed controllers require a new policy run. High-speed ground tracking remains to be validated.
 - Pushes and control latency are disabled for baseline gait learning. Observation noise and mass/friction randomization remain enabled. Enable and validate pushes/latency separately before robustness or hardware testing.
 
 To initialize a new run from a compatible policy:

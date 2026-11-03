@@ -22,7 +22,7 @@ spectral-prior evaluate
 
 The selection file specifies source windows using 30 Hz frame indices. Adjust it for your inputs, or omit `--selections` for automatic selection. Processing selects ten bilateral leg/arm joints, repeats each cycle to 10 seconds, resamples to 60 Hz and smooths the trajectories. Source and processing details are recorded in `outputs/reference/curation.json`.
 
-The bundled library is independently curated, not the authors’ original dataset. Its first walking clip uses a half-cycle-shifted right-arm trajectory for the left shoulder pitch and elbow; this edit is recorded in the metadata.
+The bundled library is independently curated, not the authors’ original dataset. Clip 1 mirrors the right arm with a half-cycle shift. Clip 4 uses clip 5’s six hip/knee/ankle pitch trajectories, phase-aligned and resampled to clip 4’s original stride period; its arms are unchanged. The speed label remains the original source-window measurement, not a measured speed of the edited gait. Both edits are reproducible through the selection file and recorded in the metadata.
 
 Train a new policy after replacing the prior. For playback or resume, keep the run’s bundled `spectral_prior.pt` with its checkpoint and `run_config.json`.
 

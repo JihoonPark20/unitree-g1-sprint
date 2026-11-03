@@ -29,9 +29,12 @@ class ReferencePlayback:
         self.clips = {}
         with np.load(library, allow_pickle=False) as data:
             joints = data["joint_names"].tolist()
-            for i, q in enumerate(data["joint_pos"]):
+            # Loop a physical cycle; the 10 s training window ends mid-stride.
+            periodic = "cycles" in data
+            for i, q in enumerate(data["cycles"] if periodic else data["joint_pos"]):
                 label = f"{i + 1}: {data['speeds'][i]:.3f} m/s, {data['frequencies'][i]:.3f} Hz"
-                self.clips[label] = self._clip(q, joints, float(data["fps"]))
+                fps = len(q) * float(data["frequencies"][i]) if periodic else float(data["fps"])
+                self.clips[label] = self._clip(q, joints, fps)
         if not self.clips:
             raise ValueError("Reference library is empty")
         self.motion = None
@@ -82,6 +85,9 @@ class ReferencePlayback:
     def reset(self, target):
         self.time = 0.0
         self.saturation = 0.0
+        self._physics_steps = 0
+        self._pd_target = np.asarray(target, dtype=float).copy()
+        self._pd_velocity = np.zeros_like(self._pd_target)
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[self.qids] = target
         mujoco.mj_forward(self.model, self.data)
@@ -90,8 +96,25 @@ class ReferencePlayback:
         for _ in range(steps):
             q = self.target(source, clip, speed, hold_wrists)
             if mode == "pd":
-                target = np.clip(q, self.limits[:, 0], self.limits[:, 1])
-                torque = self.kp * (target - self.data.qpos[self.qids]) - self.kd * self.data.qvel[self.vids]
+                if self._physics_steps % self.cfg.control.decimation == 0:
+                    velocity = np.zeros_like(q)
+                    if getattr(self.cfg.control, "reference_velocity", False):
+                        dt = self.model.opt.timestep
+                        if source == "prior":
+                            _, dq, _ = self.reference.evaluate_with_velocity([speed], dt)
+                            velocity = dq[0] * rate
+                        else:
+                            before = self.target(source, clip, speed, hold_wrists, at=self.time - 0.5 * dt * rate)
+                            after = self.target(source, clip, speed, hold_wrists, at=self.time + 0.5 * dt * rate)
+                            velocity = (after - before) / dt
+                        if hold_wrists:
+                            velocity[self.wrists] = 0
+                        velocity[((q <= self.limits[:, 0]) & (velocity < 0))
+                                 | ((q >= self.limits[:, 1]) & (velocity > 0))] = 0
+                    self._pd_target[:] = np.clip(q, self.limits[:, 0], self.limits[:, 1])
+                    self._pd_velocity[:] = velocity
+                torque = (self.kp * (self._pd_target - self.data.qpos[self.qids])
+                          + self.kd * (self._pd_velocity - self.data.qvel[self.vids]))
                 if gravity_comp:
                     # Bias at zero velocity contains gravity only, without
                     # Coriolis/centrifugal terms. Compensation shares motor limits.
@@ -109,6 +132,7 @@ class ReferencePlayback:
                 if self.data.warning.number.any():
                     raise FloatingPointError("MuJoCo reported a suspended PD dynamics warning")
             self.time += self.model.opt.timestep * rate
+            self._physics_steps += 1
         q = self.target(source, clip, speed, hold_wrists)
         if mode == "kinematic":
             self.data.qpos[self.qids] = q
@@ -160,13 +184,13 @@ class ReferenceViewer:
             title="Joint angle (degrees)", scales={"x": {"time": False}}, height=180,
         )
         gui.add_markdown(
-            "**library:** curated 10-joint training data; other joints use the default pose.\n\n"
+            "**library:** curated 10-joint cycles; other joints use the default pose.\n\n"
             "**prior:** generated training reference, including the standing blend.\n\n"
             "**motion:** optional GMR NPZ joint data; root motion is ignored. Turn off Hold wrists to inspect source wrists.\n\n"
             "**kinematic:** exact poses, without dynamics or joint-limit clipping. "
             "**pd:** gravity, torque limits and contacts remain active; targets are clipped to joint limits. "
             "Optional gravity compensation is a viewer diagnostic, not the training controller. "
-            "This is a tracking check, not a locomotion test. Clips loop and may jump at the boundary."
+            "This is a tracking check, not a locomotion test. Imported motion files may jump at the loop boundary."
         )
         self._restart_requested = False
         self._selection = None

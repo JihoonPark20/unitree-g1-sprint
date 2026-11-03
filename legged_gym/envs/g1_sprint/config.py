@@ -15,6 +15,15 @@ class SprintCfg(G1FlatCfg):
 
     class control(G1FlatCfg.control):
         decimation = 4  # 200 Hz physics, 50 Hz policy
+        stiffness = {
+            **G1FlatCfg.control.stiffness, ".*_hip_pitch_joint": 200.0,
+            ".*_knee_joint": 300.0, ".*_(ankle_pitch|shoulder_pitch|elbow)_joint": 80.0,
+        }
+        damping = {
+            **G1FlatCfg.control.damping, ".*_hip_pitch_joint": 4.0, ".*_knee_joint": 8.0,
+            ".*_ankle_pitch_joint": 4.0, ".*_(shoulder_pitch|elbow)_joint": 2.0,
+        }
+        reference_velocity = True
         action_scale = 0.25
         clip_actions = 2.0
         # Physical residual bounds, in radians, around the prior/default pose.

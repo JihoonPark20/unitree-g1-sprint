@@ -29,12 +29,22 @@ class ReferenceGenerator:
         self.phase = (self.phase + self.mapping(speed) * dt) % 1
 
     @torch.no_grad()
-    def evaluate(self, speed):
+    def evaluate(self, speed, *, time_offset=0.0):
         speed = torch.as_tensor(speed, dtype=torch.float32)
         f = self.mapping(speed)
-        generated = self.prior(self.phase, f, sample=False)[0]
+        phase = self.phase if time_offset == 0 else (self.phase + f * time_offset) % 1
+        generated = self.prior(phase, f, sample=False)[0]
         weight = (speed / self.blend_speed).clamp(0, 1)
         weight = weight.square() * (3 - 2 * weight)
         reference = self.default.expand(len(speed), -1).clone()
         reference[:, self.indices] = torch.lerp(self.default[self.indices], generated, weight[:, None])
         return reference.numpy(), f.numpy()
+
+    def evaluate_with_velocity(self, speed, dt):
+        """Phase velocity at the current command; residual actions remain position offsets."""
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("Velocity differentiation requires a positive finite timestep")
+        position, frequency = self.evaluate(speed)
+        before, _ = self.evaluate(speed, time_offset=-0.5 * dt)
+        after, _ = self.evaluate(speed, time_offset=0.5 * dt)
+        return position, (after - before) / dt, frequency

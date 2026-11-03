@@ -55,6 +55,8 @@ def policy_contract(env):
     if getattr(env, "residual_limits", None) is not None:
         contract["version"] = 3
         contract["residual_limits_rad"] = env.residual_limits.tolist()
+    if getattr(env.cfg.control, "reference_velocity", False):
+        contract["reference_velocity"] = "phase_central_difference"
     return contract
 
 
@@ -188,6 +190,7 @@ class TaskRegistry:
                 # Missing snapshot fields must not inherit tighter new defaults:
                 # old checkpoint playback keeps its original action semantics.
                 env_cfg.control.residual_limits = snapshot["env"]["control"].get("residual_limits")
+                env_cfg.control.reference_velocity = snapshot["env"]["control"].get("reference_velocity", False)
                 env_cfg.commands.curriculum_progress = snapshot["env"]["commands"].get("curriculum_progress")
                 env_cfg.rewards.signed_feet_distance = snapshot["env"]["rewards"].get("signed_feet_distance", False)
                 env_cfg.rewards.air_height_command_gate = snapshot["env"]["rewards"].get("air_height_command_gate", False)
