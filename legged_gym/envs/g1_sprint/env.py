@@ -39,6 +39,7 @@ class SprintEnv(SprintRobot):
             "Gait/signed_foot_separation_m", "Gait/feet_crossed_fraction",
         )
         self._diagnostic_sums = np.zeros((cfg.env.num_envs, len(self._diagnostic_names)))
+        self._joint_residual_sums = np.zeros((cfg.env.num_envs, 3, len(cfg.asset.action_joint_names)))
         self._torque_saturation_sums = np.zeros((cfg.env.num_envs, len(cfg.asset.joint_names)))
         default = joint_parameters(cfg.asset.joint_names, cfg.init_state.default_joint_angles, 0)
         self.reference = ReferenceGenerator(
@@ -91,6 +92,7 @@ class SprintEnv(SprintRobot):
     def reset_idx(self, ids):
         super().reset_idx(ids)
         self._diagnostic_sums[ids] = 0
+        self._joint_residual_sums[ids] = 0
         self._torque_saturation_sums[ids] = 0
         self._feet_crossing_steps[ids] = 0
         self.feet_crossing_buf[ids] = False
@@ -138,10 +140,18 @@ class SprintEnv(SprintRobot):
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
         # Previous-action observations describe the bounded residual actually
         # requested from PD, while PPO retains its original sampled actions.
-        self._diagnostic_sums[:, 0] += np.sqrt(np.square(self.cfg.control.action_scale * self.actions).mean(1))
-        self._diagnostic_sums[:, 1] += (np.abs(actions - self.actions) > 1e-7).mean(1)
+        residual = self.cfg.control.action_scale * self.actions
+        clipped = np.abs(actions - self.actions) > 1e-7
+        bound = self.cfg.control.action_scale * self.cfg.control.clip_actions
+        if self.residual_limits is not None:
+            bound = np.minimum(bound, self.residual_limits)
+        self._joint_residual_sums[:, 0] += np.square(residual)
+        self._joint_residual_sums[:, 1] += np.abs(residual) >= 0.99 * bound
+        self._joint_residual_sums[:, 2] += clipped
+        self._diagnostic_sums[:, 0] += np.sqrt(np.square(residual).mean(1))
+        self._diagnostic_sums[:, 1] += clipped.mean(1)
         target = self.q_ref.copy()
-        target[:, self.action_dof_indices] += self.cfg.control.action_scale * self.actions
+        target[:, self.action_dof_indices] += residual
         # Wrist joints remain physical: PD holds a fixed pose under external loads.
         target[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
         # Joint constraints apply to the combined reference+residual, not either separately.
@@ -234,6 +244,12 @@ class SprintEnv(SprintRobot):
         saturation = (self._torque_saturation_sums[ids] / lengths).mean(0)
         metrics["Control/torque_saturation"] = float(saturation.mean())
         metrics.update({f"TorqueSaturation/{name}": float(value) for name, value in zip(self.dof_names, saturation)})
+        joint_means = self._joint_residual_sums[ids] / lengths[:, :, None]
+        joint_means[:, 0] = np.sqrt(joint_means[:, 0])
+        for tag, values in zip(
+            ("ResidualRMS", "ResidualLimitFraction", "ActionClipFraction"), joint_means.mean(0),
+        ):
+            metrics.update({f"{tag}/{name}": float(value) for name, value in zip(self.action_dof_names, values)})
         return metrics
 
     def _record_tracking_diagnostics(self):

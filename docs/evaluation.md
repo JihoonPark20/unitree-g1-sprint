@@ -36,5 +36,3 @@ Defaults: **61 forward commands from 0 to 6 m/s**, spaced by 0.1 m/s; zero later
 A fall ends the trial; automatic resets do not replace failed samples. Incomplete trials produce `null` full aggregate scores and separate observed-only diagnostics. Check survival and `paper_grid_complete` alongside errors. Saved reports include settings and checkpoint hashes; `--save-trajectories` also exports NPZ traces.
 
 Use `--speeds`, `--seconds`, `--warmup-seconds`, `--seeds` and `--num_envs` for shorter checks. Compare policies using identical settings. The metrics follow [SPRINT Eqs. 15–19](https://arxiv.org/html/2605.28549v1#S4.SS1), but use this project's MuJoCo protocol. `FID_joint` uses raw joint angles and is not established as numerically comparable to the paper’s FID.
-
-한국어: 정책은 기본적으로 0–6 m/s의 61개 속도에서 평가합니다. 낙상한 실행은 실패로 기록하며 전체 점수는 `null`이 됩니다. 같은 설정으로 생존율과 오차를 함께 비교하세요.
