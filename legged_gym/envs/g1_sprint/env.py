@@ -14,6 +14,10 @@ from spectral_prior.reference import ReferenceGenerator
 
 class SprintEnv(SprintRobot):
     def __init__(self, cfg, **kwargs):
+        roll_scale = cfg.rewards.scales.get("torso_roll", 0.0)
+        roll_deadzone = getattr(cfg.rewards, "torso_roll_deadzone", 0.1)
+        if not np.isfinite([roll_scale, roll_deadzone]).all() or roll_scale > 0 or not 0 <= roll_deadzone < 1:
+            raise ValueError("torso_roll requires a nonpositive scale and a projected-gravity dead zone in [0, 1)")
         if (
             not np.isfinite([cfg.control.action_scale, cfg.control.clip_actions]).all()
             or cfg.control.action_scale <= 0 or cfg.control.clip_actions <= 0
@@ -37,6 +41,7 @@ class SprintEnv(SprintRobot):
             "Tracking/prior_mae_rad", "Tracking/forward_mae_m_s", "Tracking/yaw_mae_rad_s",
             "Gait/both_ground_fraction", "Gait/single_support_fraction", "Gait/both_air_fraction",
             "Gait/signed_foot_separation_m", "Gait/feet_crossed_fraction",
+            "Posture/roll_rad", "Posture/roll_abs_rad",
         )
         self._diagnostic_sums = np.zeros((cfg.env.num_envs, len(self._diagnostic_names)))
         self._joint_residual_sums = np.zeros((cfg.env.num_envs, 3, len(cfg.asset.action_joint_names)))
@@ -77,6 +82,7 @@ class SprintEnv(SprintRobot):
         self._command_motion_sums = np.zeros((cfg.env.num_envs, 3))
         self._command_settled_steps = np.zeros(cfg.env.num_envs, dtype=int)
         self.record_evaluation = False
+        self.record_failure_trace = False
         super().__init__(cfg, **kwargs)
         self._foot_quat = self.sim.batch.bind("xquat")
 
@@ -169,8 +175,17 @@ class SprintEnv(SprintRobot):
         self._push_robots()
         self._first_contact.fill(False)
         self._touchdown_air_time.fill(0)
+        if self.record_failure_trace:
+            step_saturation = np.zeros_like(self.torques)
+            step_torque_peak = np.zeros_like(self.torques)
         for substep in range(self.cfg.control.decimation):
             self.torques[:] = self._compute_torques(self.actions)
+            if self.record_failure_trace:
+                p_torque = self.p_gains * (self.target_position - self.sim.qpos[:, self.sim.qpos_ids])
+                d_torque = self.d_gains * (self.target_velocity - self.sim.qvel[:, self.sim.qvel_ids])
+                requested_torque = p_torque + d_torque
+                step_saturation += (np.abs(self.torques) >= 0.99 * self.torque_limits) / self.cfg.control.decimation
+                np.maximum(step_torque_peak, np.abs(self.torques), out=step_torque_peak)
             self._torque_saturation_sums += (
                 np.abs(self.torques) >= 0.99 * self.torque_limits
             ) / self.cfg.control.decimation
@@ -196,10 +211,12 @@ class SprintEnv(SprintRobot):
         self.filtered_speed += np.clip(self.commands[:, 0] - self.filtered_speed, -delta, delta)
         self._update_reference()
         self.compute_observations()
-        dones = torch.from_numpy(self.reset_buf.copy())
+        # check_termination replaces these arrays on the next step, and
+        # reset_idx does not mutate them, so retained flags remain stable.
+        dones = torch.from_numpy(self.reset_buf)
         rewards = torch.from_numpy(self.rew_buf.astype(np.float32))
         extras = {
-            "time_outs": torch.from_numpy(self.time_out_buf.copy()),
+            "time_outs": torch.from_numpy(self.time_out_buf),
             "feet_crossing": torch.from_numpy(self.feet_crossing_buf.copy()),
         }
         if self.record_evaluation:
@@ -211,6 +228,42 @@ class SprintEnv(SprintRobot):
                 "reference_joint_pos": self.q_ref[:, self.reference.indices].copy(),
                 "forward_velocity": (np.cos(yaw) * self.sim.qvel[:, 0] + np.sin(yaw) * self.sim.qvel[:, 1]).copy(),
             }
+            if self.record_failure_trace:
+                gravity = self.projected_gravity
+                tilt = np.arccos(np.clip(-gravity[:, 2], -1, 1))
+                extras["evaluation"]["failure_trace"] = {
+                    "roll_rad": np.arctan2(-gravity[:, 1], -gravity[:, 2]),
+                    "pitch_rad": np.arcsin(np.clip(gravity[:, 0], -1, 1)),
+                    "tilt_rad": tilt,
+                    "angular_velocity": self.base_ang_vel.copy(),
+                    "base_height_m": self.base_height.copy(),
+                    "feet_contact": self._feet_contact.copy(),
+                    "feet_height_m": self.feet_pos[:, :, 2].copy(),
+                    "signed_foot_separation_m": self._signed_foot_separation().copy(),
+                    "phase": self.reference.phase.numpy().copy(),
+                    "frequency_hz": self.frequency.copy(),
+                    "forward_velocity": extras["evaluation"]["forward_velocity"].copy(),
+                    "issued_residual_rad": residual.copy(),
+                    "joint_pos_rad": self.dof_pos[:, self.action_dof_indices].copy(),
+                    "pd_target_rad": self.target_position[:, self.action_dof_indices].copy(),
+                    "joint_velocity_rad_s": self.dof_vel[:, self.action_dof_indices].copy(),
+                    "pd_target_velocity_rad_s": self.target_velocity[:, self.action_dof_indices].copy(),
+                    "torque_last_substep_Nm": self.torques[:, self.action_dof_indices].copy(),
+                    "requested_torque_last_substep_Nm": requested_torque[:, self.action_dof_indices].copy(),
+                    "p_torque_last_substep_Nm": p_torque[:, self.action_dof_indices].copy(),
+                    "d_torque_last_substep_Nm": d_torque[:, self.action_dof_indices].copy(),
+                    "torque_peak_abs_Nm": step_torque_peak[:, self.action_dof_indices].copy(),
+                    "torque_saturation_fraction": step_saturation[:, self.action_dof_indices].copy(),
+                    "foot_contact_force_norm_N": np.linalg.norm(self.contact_forces[:, self.feet_indices], axis=-1),
+                    "feet_position_world_m": self.feet_pos.copy(),
+                    "pelvis_position_world_m": self.base_pos.copy(),
+                    "failure_flags": np.column_stack((
+                        tilt > self.cfg.termination.max_tilt,
+                        self.base_height < self.cfg.termination.min_height,
+                        (self._contact_peak[:, self._root_contact_index] > self.cfg.rewards.contact_threshold)
+                        & bool(self.cfg.termination.base_contact), self.feet_crossing_buf,
+                    )),
+                }
         ids = np.flatnonzero(self.reset_buf)
         if ids.size:
             extras["terminal_observations"] = self.obs_buf[torch.from_numpy(ids)].clone()
@@ -265,6 +318,9 @@ class SprintEnv(SprintRobot):
         separation = self._signed_foot_separation()
         self._diagnostic_sums[:, 9] += separation
         self._diagnostic_sums[:, 10] += separation < 0
+        roll = np.arctan2(-self.projected_gravity[:, 1], -self.projected_gravity[:, 2])
+        self._diagnostic_sums[:, 11] += roll
+        self._diagnostic_sums[:, 12] += np.abs(roll)
 
     def _resample_commands(self, ids):
         if not len(ids):
@@ -397,6 +453,10 @@ class SprintEnv(SprintRobot):
         # Eq. 14 uses the commanded speed, before the reference acceleration ramp.
         forward = 0.1 + 0.05 * self.commands[:, 0]
         return np.square(np.maximum(0, gx - forward) + np.maximum(0, -gx))
+
+    def _reward_torso_roll(self):
+        deadzone = getattr(self.cfg.rewards, "torso_roll_deadzone", 0.1)
+        return np.square(np.maximum(np.abs(self.projected_gravity[:, 1]) - deadzone, 0.0))
 
     def training_state_dict(self):
         state = super().training_state_dict()

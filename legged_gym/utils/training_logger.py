@@ -13,6 +13,9 @@ from .helpers import class_to_dict
 
 class TrainingLogger(Logger):
     def __init__(self, *args, control_dt, setup_output="", **kwargs):
+        # MuJoCo metrics originate on the host. Keep episodic bookkeeping there
+        # instead of launching a device kernel and synchronization per scalar.
+        kwargs["device"] = "cpu"
         super().__init__(*args, **kwargs)
         self.control_dt = control_dt
         self.setup_output = setup_output
@@ -28,17 +31,24 @@ class TrainingLogger(Logger):
             settings = json.dumps({"env": class_to_dict(self.env_cfg), "train": self.cfg}, indent=2, default=str)
             self.writer.add_text("Setup/config", f"```json\n{settings}\n```", 0)
 
+    def process_env_step(self, rewards, dones, extras, intrinsic_rewards=None):
+        super().process_env_step(
+            rewards.detach().cpu(), dones.detach().cpu(), extras,
+            None if intrinsic_rewards is None else intrinsic_rewards.detach().cpu(),
+        )
+
     def log(self, it, start_it, total_it, collect_time, learn_time, loss_dict,
             learning_rate, action_std, rnd_weight, **kwargs):
         # Keep writer updates at EVERY iteration, independently of console cadence.
         if self.writer is None:
             return
         collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
-        iteration_time = collect_time + learn_time
+        iteration_time = kwargs.get("iteration_time", collect_time + learn_time)
         self.tot_timesteps += collection_size
         self.tot_time += iteration_time
         fps = int(collection_size / max(iteration_time, 1e-9))
 
+        action_std = torch.as_tensor(action_std).detach().cpu()
         episode_metrics = {}
         for key in dict.fromkeys(k for info in self.ep_extras for k in info):
             values = [torch.as_tensor(info[key], device=self.device).reshape(-1)
@@ -74,7 +84,7 @@ class TrainingLogger(Logger):
             eta = datetime.timedelta(seconds=int(self.tot_time / done * (total_it - it - 1)))
             self._print_progress(
                 it, total_it, fps, collect_time, learn_time, loss_dict,
-                learning_rate, action_std, reward, length, episode_metrics, eta,
+                learning_rate, action_std, reward, length, episode_metrics, eta, iteration_time,
             )
 
         if isinstance(self.writer, LogWriter):
@@ -85,7 +95,7 @@ class TrainingLogger(Logger):
         self.ep_extras.clear()
 
     def _print_progress(self, it, total_it, fps, collect_time, learn_time, losses,
-                        learning_rate, action_std, reward, length, metrics, eta):
+                        learning_rate, action_std, reward, length, metrics, eta, iteration_time):
         width, pad = 80, 40
         # Match the upstream iteration index (and checkpoint/TensorBoard step).
         lines = ["#" * width, f" Learning iteration {it}/{total_it} ".center(width), ""]
@@ -109,13 +119,13 @@ class TrainingLogger(Logger):
             row("Mean reward", f"{reward:.2f}")
             row("Mean episode length", f"{length:.2f}")
         row("Mean action std", f"{action_std.mean().item():.2f}")
-        # All reward terms belong in the standard episode log. Detailed custom
-        # diagnostics remain in TensorBoard without overwhelming the terminal.
+        # Baseline rewards use the standard episode log; optional roll shaping
+        # and detailed diagnostics remain in TensorBoard.
         for key, value in metrics.items():
-            if key.startswith("Reward/") or key == "Curriculum/max_command_x":
+            if (key.startswith("Reward/") and key != "Reward/torso_roll") or key == "Curriculum/max_command_x":
                 row(key, f"{value:.4f}")
         lines.append("-" * width)
-        row("Iteration time", f"{collect_time + learn_time:.2f}s")
+        row("Iteration time", f"{iteration_time:.2f}s")
         row("Time elapsed", str(datetime.timedelta(seconds=int(self.tot_time))))
         row("ETA", str(eta))
         print("\n".join(lines) + "\n", flush=True)

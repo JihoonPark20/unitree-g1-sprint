@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from legged_gym.utils.failure_trace import FailureTrace
 
 from spectral_prior import JOINT_NAMES
 from spectral_prior.data import sha256
@@ -30,6 +31,9 @@ def aggregate_results(results):
 
 
 def evaluate_policy(env, runner, args):
+    failure_window = getattr(args, "failure_window", 0.0)
+    if not np.isfinite(failure_window) or failure_window < 0:
+        raise ValueError("failure_window must be finite and nonnegative")
     if args.seconds < env.dt or args.warmup_seconds < 0:
         raise ValueError("Measurement must last at least one control tick and warmup must be nonnegative")
     warmup = int(np.ceil(args.warmup_seconds / env.dt))
@@ -41,11 +45,12 @@ def evaluate_policy(env, runner, args):
     env.cfg.commands.curriculum = False
     env.cfg.commands.standing_fraction = 0
     env.record_evaluation = True
+    env.record_failure_trace = failure_window > 0
     policy = runner.get_inference_policy(device=runner.device)
     results, pooled_q, pooled_ref = [], [], []
     output = Path(args.output)
     trace_dir = output.with_suffix("")
-    if args.save_trajectories:
+    if args.save_trajectories or failure_window:
         trace_dir.mkdir(parents=True, exist_ok=True)
     try:
         with torch.inference_mode():
@@ -66,10 +71,14 @@ def evaluate_policy(env, runner, args):
                     sums_speed = np.zeros(env.num_envs)
                     reached = np.zeros(env.num_envs, dtype=bool)
                     failure_times = [None] * env.num_envs
+                    failure_trace = FailureTrace(env.num_envs, env.dt, failure_window) if failure_window else None
                     q_rows, ref_rows, trace_rows = [], [], []
                     for step in range(total):
                         obs, _, dones, extras = env.step(policy(obs.to(runner.device)))
                         sample = extras["evaluation"]  # t+dt, before automatic reset
+                        done = dones.cpu().numpy().astype(bool)
+                        if failure_trace is not None:
+                            failure_trace.record(sample["failure_trace"], active, done)
                         if step >= warmup:
                             ids = np.flatnonzero(active)
                             q = sample["joint_pos"][ids]
@@ -86,7 +95,6 @@ def evaluate_policy(env, runner, args):
                                 trace_rows.append(
                                     np.column_stack((ids, np.full(len(ids), (step + 1) * env.dt), velocity))
                                 )
-                        done = dones.cpu().numpy().astype(bool)
                         if np.any(active & extras["time_outs"].cpu().numpy().astype(bool)):
                             raise RuntimeError("Unexpected timeout inside the evaluation horizon")
                         for index in np.flatnonzero(active & done):
@@ -100,6 +108,13 @@ def evaluate_policy(env, runner, args):
                     reference = np.concatenate(ref_rows) if ref_rows else np.empty((0, 10), dtype=np.float32)
                     speed_q.append(q)
                     speed_ref.append(reference)
+                    if failure_trace is not None:
+                        failure_trace.save(trace_dir / f"failure_v{speed:g}_seed{seed}.npz", active,
+                                           env.action_dof_names, env.cfg.asset.feet,
+                                           control={"p_gains": env.p_gains[env.action_dof_indices],
+                                                    "d_gains": env.d_gains[env.action_dof_indices],
+                                                    "torque_limits_Nm": env.torque_limits[env.action_dof_indices],
+                                                    "physics_dt_s": env.cfg.sim.dt, "control_dt_s": env.dt})
                     for i in range(env.num_envs):
                         n = int(counts[i])
                         trials.append(
@@ -113,6 +128,7 @@ def evaluate_policy(env, runner, args):
                                 "E_qpos_observed": float(sums_q[i] / n) if n else None,
                                 "E_vel_observed": float(sums_v[i] / n) if n else None,
                                 "mean_forward_speed": float(sums_speed[i] / n) if n else None,
+                                **({"failure_diagnostics": failure_trace.summaries[i]} if failure_trace else {}),
                             }
                         )
                     if args.save_trajectories:
@@ -149,6 +165,7 @@ def evaluate_policy(env, runner, args):
                 )
     finally:
         env.record_evaluation = False
+        env.record_failure_trace = False
     aggregate = aggregate_results(results)
     q, reference = np.concatenate(pooled_q), np.concatenate(pooled_ref)
     fid = frechet_distance(reference, q) if len(q) >= 2 else None
@@ -193,6 +210,9 @@ def evaluate_policy(env, runner, args):
             "fid_comparability": "Paper feature extraction unspecified; FID_joint is not table-equivalent FID",
             "reached_speed": "at least one measured actual-velocity sample within 0.05 m/s; diagnostic only, never a sample filter",
             "trajectory_directory": str(trace_dir.resolve()) if args.save_trajectories else None,
+            "failure_trace_directory": str(trace_dir.resolve()) if failure_window else None,
+            "failure_window_seconds": failure_window,
+            "failure_trace_sampling": "Last window including terminal state before reset; survivors end at horizon. Phase is t+dt; PD target and issued residual produced that transition. Feet follow foot_names. Reasons are nonexclusive.",
         },
         "aggregate": aggregate,
         "results": results,

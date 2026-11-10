@@ -13,7 +13,7 @@ setup(
     + ["legged_gym.resources"],
     package_dir={"legged_gym.resources": "resources"},
     author_email="rudinn@ethz.ch",
-    description="Unofficial SPRINT spectral priors and residual PPO in legged_gym format",
+    description="Unofficial SPRINT spectral priors and residual policies in legged_gym format",
     python_requires=">=3.10,<3.14",
     include_package_data=True,
     package_data={

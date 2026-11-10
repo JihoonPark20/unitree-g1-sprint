@@ -15,14 +15,15 @@ from spectral_prior.data import sha256
 def sprint_runner_config(train):
     config = runner_config(train)
     config["algorithm"]["class_name"] = "legged_gym.algorithms.ppo:SprintPPO"
-    for key in ("actor", "critic"):
-        config[key].update(
-            class_name="legged_gym.modules.actor_critic:SprintRecurrentModel",
-            feature_dim=256,
-            rnn_hidden_dim=64,
-            rnn_type="lstm",
-            rnn_num_layers=1,
-        )
+    if getattr(train.policy, "recurrent", True):
+        for key in ("actor", "critic"):
+            config[key].update(
+                class_name="legged_gym.modules.actor_critic:SprintRecurrentModel",
+                feature_dim=256,
+                rnn_hidden_dim=64,
+                rnn_type="lstm",
+                rnn_num_layers=1,
+            )
     return config
 
 
@@ -45,7 +46,7 @@ class SprintRunner(LeggedOnPolicyRunner):
         )
 
     def sprint_contract(self):
-        return {
+        contract = {
             "version": 2,
             "action_joint_names": self.env.action_dof_names,
             "held_joint_control": "default_pose_pd",
@@ -58,6 +59,7 @@ class SprintRunner(LeggedOnPolicyRunner):
             "observation": "angular_gravity_filtered_commands_q_dq_previous_residual",
             "critic_extra": "base_linear_velocity_reference_10",
         }
+        return contract
 
     def save(self, path, infos=None):
         metadata = dict(infos or {})

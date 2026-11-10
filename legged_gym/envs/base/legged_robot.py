@@ -88,6 +88,7 @@ class SprintRobot(VecEnv):
         self._contact_cursor = 0
         self._prepare_reward_function()
         self.episode_sums = {name: np.zeros(self.num_envs) for name in self.reward_scales}
+        self.rew_buf = np.zeros(self.num_envs)
         self._history = {}
         self.obs_buf = None
         self._viewer = None
@@ -147,7 +148,7 @@ class SprintRobot(VecEnv):
         self.reset_buf = self.terminated_buf | self.time_out_buf
 
     def compute_reward(self):
-        self.rew_buf = np.zeros(self.num_envs)
+        self.rew_buf.fill(0)
         for name, function in self.reward_functions.items():
             value = function() * self.reward_scales[name] * self.dt
             self.rew_buf += value
@@ -170,33 +171,43 @@ class SprintRobot(VecEnv):
         return terms
 
     def compute_observations(self, ids=None):
-        if ids is None:
-            ids = np.arange(self.num_envs)
+        # The usual full-batch step can use views instead of advanced-index
+        # copies of every observation term and history. Partial resets still
+        # update only the selected rows, without advancing surviving episodes.
+        rows = slice(None) if ids is None else ids
+        noise_scales = {
+            "ang_vel": self.cfg.noise.ang_vel * 0.2,
+            "gravity": self.cfg.noise.gravity,
+            "joint_pos": self.cfg.noise.joint_pos,
+            "joint_vel": self.cfg.noise.joint_vel * 0.05,
+        } if self.cfg.noise.add_noise else {}
         data = {}
         for group in ("policy", "critic"):
             terms = self._observation_terms(critic=group == "critic")
             flattened = []
             for name, value in terms.items():
-                value = value[ids].copy()
-                if group == "policy" and self.cfg.noise.add_noise:
-                    noise = {
-                        "ang_vel": self.cfg.noise.ang_vel * 0.2,
-                        "gravity": self.cfg.noise.gravity,
-                        "joint_pos": self.cfg.noise.joint_pos,
-                        "joint_vel": self.cfg.noise.joint_vel * 0.05,
-                    }.get(name, 0.0)
+                value = value[rows]
+                if group == "policy":
+                    noise = noise_scales.get(name, 0.0)
                     if noise:
-                        value += self.rng.uniform(-noise, noise, value.shape)
+                        # A full-batch value may alias simulator/task state.
+                        value = value + self.rng.uniform(-noise, noise, value.shape)
                 key = (group, name)
                 if key not in self._history:
                     self._history[key] = np.zeros(
                         (self.num_envs, self.cfg.env.history_length, value.shape[-1]), dtype=np.float32
                     )
                 history = self._history[key]
-                history[ids, :-1] = history[ids, 1:]
-                history[ids, -1] = np.clip(value, -100.0, 100.0)
+                history[rows, :-1] = history[rows, 1:]
+                if ids is None:
+                    np.clip(value, -100.0, 100.0, out=history[:, -1])
+                else:
+                    history[ids, -1] = np.clip(value, -100.0, 100.0)
                 # Isaac Lab flattens history within each term, oldest first.
                 flattened.append(history.reshape(self.num_envs, -1))
+            # Keep the export as an independent float32 snapshot. CPU replay
+            # retains the previous observation across step(), and .to("cpu")
+            # need not copy; returning a reusable history buffer corrupts it.
             data[group] = torch.from_numpy(np.concatenate(flattened, axis=-1))
         self.obs_buf = TensorDict(data, batch_size=[self.num_envs])
 
@@ -266,12 +277,28 @@ class SprintRobot(VecEnv):
             self._next_push[ids] = self.rng.uniform(*self.cfg.domain_rand.push_interval_s, len(ids))
 
     def _episode_metrics(self, ids):
+        lengths = self.episode_length_buf.numpy()[ids] * self.dt
+        tilt = np.arccos(np.clip(-self.projected_gravity[ids, 2], -1.0, 1.0))
         return {
             **{
                 f"Reward/{name}": float(values[ids].mean() / self.cfg.env.episode_length_s)
                 for name, values in self.episode_sums.items()
             },
-            "Episode/length_s": float(self.episode_length_buf.numpy()[ids].mean() * self.dt),
+            "Episode/length_s": float(lengths.mean()),
+            # Completed-episode reach rates, including the terminal tick.
+            "Episode/reached_2s_fraction": float((lengths >= 2.0 - 1e-12).mean()),
+            "Episode/reached_5s_fraction": float((lengths >= 5.0 - 1e-12).mean()),
+            # Nonexclusive causes, measured before automatic reset.
+            "Episode/tilt_fraction": float((tilt > self.cfg.termination.max_tilt).mean()),
+            "Episode/low_height_fraction": float((self.base_height[ids] < self.cfg.termination.min_height).mean()),
+            "Episode/base_contact_fraction": float((
+                (self._contact_peak[ids, self._root_contact_index] > self.cfg.rewards.contact_threshold)
+                & self.cfg.termination.base_contact
+            ).mean()),
+            "Episode/reward_per_second": float(
+                sum(values[ids].sum() for values in self.episode_sums.values())
+                / max(self.episode_length_buf.numpy()[ids].sum() * self.dt, self.dt)
+            ),
             "Episode/time_out_fraction": float(self.time_out_buf[ids].mean()),
             "Curriculum/max_command_x": float(self.command_ranges[0, 1]),
         }

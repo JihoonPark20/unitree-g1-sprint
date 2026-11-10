@@ -17,11 +17,12 @@ class SprintCfg(G1FlatCfg):
         decimation = 4  # 200 Hz physics, 50 Hz policy
         stiffness = {
             **G1FlatCfg.control.stiffness, ".*_hip_pitch_joint": 200.0,
-            ".*_knee_joint": 300.0, ".*_(ankle_pitch|shoulder_pitch|elbow)_joint": 80.0,
+            ".*_knee_joint": 300.0, ".*_(shoulder_pitch|elbow)_joint": 80.0,
+            ".*_ankle_pitch_joint": 40.0,
         }
         damping = {
             **G1FlatCfg.control.damping, ".*_hip_pitch_joint": 4.0, ".*_knee_joint": 8.0,
-            ".*_ankle_pitch_joint": 4.0, ".*_(shoulder_pitch|elbow)_joint": 2.0,
+            ".*_ankle_pitch_joint": 2.0, ".*_(shoulder_pitch|elbow)_joint": 2.0,
         }
         reference_velocity = True
         action_scale = 0.25
@@ -59,6 +60,7 @@ class SprintCfg(G1FlatCfg):
 
     class rewards(G1FlatCfg.rewards):
         soft_dof_pos_limit = 1.0
+        torso_roll_deadzone = 0.1  # Absolute lateral projected gravity, not radians.
         # Do not reward foot lifting while commanded to stand. Reuse the
         # prior's smooth speed blend; lateral/turn commands still allow steps.
         air_height_command_gate = True
@@ -95,6 +97,7 @@ class SprintCfg(G1FlatCfg):
             # RuN's -2 projected-gravity penalty scale, with SPRINT Eq.14
             # speed-dependent dead zone retained. Not an identical reward.
             "torso_pitch": -2.0,
+            "torso_roll": 0.0,  # Optional stabilization experiment; disabled for the baseline.
         }
 
 
@@ -112,6 +115,7 @@ class SprintPPOCfg(G1FlatCfgPPO):
         log_interval = 1  # Console only; TensorBoard and Viser update every iteration.
 
     class policy(G1FlatCfgPPO.policy):
+        recurrent = True
         actor_hidden_dims = []
         critic_hidden_dims = []
         activation = "elu"

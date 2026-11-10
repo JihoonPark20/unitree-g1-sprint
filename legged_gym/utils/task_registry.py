@@ -195,7 +195,8 @@ class TaskRegistry:
                 env_cfg.rewards.signed_feet_distance = snapshot["env"]["rewards"].get("signed_feet_distance", False)
                 env_cfg.rewards.air_height_command_gate = snapshot["env"]["rewards"].get("air_height_command_gate", False)
                 env_cfg.termination.terminate_on_feet_crossing = snapshot["env"]["termination"].get("terminate_on_feet_crossing", False)
-                train_cfg.policy.noise_std_range = snapshot["train"]["policy"].get("noise_std_range", [1e-6, 1e6])
+                if hasattr(train_cfg, "policy"):
+                    train_cfg.policy.noise_std_range = snapshot["train"]["policy"].get("noise_std_range", [1e-6, 1e6])
                 if legacy_rewards:
                     # Old policies used one shared width for both tracking terms.
                     env_cfg.rewards.tracking_ang_sigma = env_cfg.rewards.tracking_sigma
@@ -266,7 +267,9 @@ class TaskRegistry:
                         "env": class_to_dict(env.cfg),
                         "train": class_to_dict(train_cfg),
                         "rl_device": device,
-                        "dependencies": {key: version(key) for key in ("rsl-rl-lib", "mujoco", "torch")},
+                        "dependencies": {
+                            key: version(key) for key in ("rsl-rl-lib", "mujoco", "torch")
+                        },
                         "reward_definition": "SPRINT Eq.14 torso bound uses raw commanded vx",
                         "contract": policy_contract(env),
                         "warm_start_checkpoint": getattr(args, "warm_start", None),

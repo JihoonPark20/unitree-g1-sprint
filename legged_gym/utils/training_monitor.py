@@ -1,4 +1,4 @@
-"""Read-only Viser monitoring of a selected training environment and PPO progress.
+"""Read-only Viser monitoring of a selected training environment and learning progress.
 
 The trainer copies at most one state per display interval. Rendering uses a
 private MuJoCo model/data pair on a worker thread, with a single pending frame.
@@ -80,11 +80,13 @@ class TrainingMonitor:
             f"## {task.upper()} · Live training\nObserving sampled training actions, including exploration."
         )
         self.environment = gui.add_number("Environment", initial_value=0, min=0, max=self.env.num_envs - 1, step=1)
-        self.camera = ViserCameraControls(self.server, self.env.sim.qpos[0, :3])
+        self.camera = ViserCameraControls(
+            self.server, self.env.sim.qpos[0, :3], root_quat=self.env.sim.qpos[0, 3:7],
+        )
         self.freeze = gui.add_checkbox(
             "Freeze view", initial_value=False, hint="Training continues while the view is frozen."
         )
-        self.progress = gui.add_markdown("Waiting for the first PPO iteration…")
+        self.progress = gui.add_markdown("Waiting for the first training iteration…")
         self.motion = gui.add_markdown("Waiting for a training frame…")
         empty = np.array([0.0], dtype=np.float64)
         self.velocity_plot = gui.add_uplot(
@@ -177,7 +179,7 @@ class TrainingMonitor:
         logger = self.runner.logger
         reward = float(np.mean(logger.rewbuffer)) if logger.rewbuffer else None
         length = float(np.mean(logger.lenbuffer)) * self.env.dt if logger.lenbuffer else None
-        elapsed = kwargs["collect_time"] + kwargs["learn_time"]
+        elapsed = kwargs.get("iteration_time", kwargs["collect_time"] + kwargs["learn_time"])
         with self._lock:
             self._stats = {
                 "iteration": kwargs["it"],
@@ -209,7 +211,7 @@ class TrainingMonitor:
                     self._shown_stats_version = version
         except Exception as error:
             self._stop.set()
-            print(f"Training monitor stopped updating: {error}. PPO training continues.")
+            print(f"Training monitor stopped updating: {error}. Training continues.")
 
     def _publish_frame(self, frame):
         self.data.qpos[:] = frame["qpos"]
@@ -232,7 +234,7 @@ class TrainingMonitor:
                 frame["velocity"][2],
             )
         )
-        self.camera.update_root(root)
+        self.camera.update_root(root, root_quat=frame["qpos"][3:7])
         with self.server.atomic():
             self.scene.update_from_mjdata(self.data)
             command, velocity = frame["command"], frame["velocity"]
@@ -259,7 +261,7 @@ class TrainingMonitor:
             f"**Iteration {stats['iteration'] + 1:,} / {stats['total']:,}**\n\n"
             f"Episode return: **{reward}** · Length: **{length}**\n\n"
             f"{stats['fps']:,.0f} samples/s · LR {stats['lr']:.2g}\n\n"
-            f"Collection {stats['collect']:.2f}s · PPO {stats['learn']:.2f}s"
+            f"Collection {stats['collect']:.2f}s · Update {stats['learn']:.2f}s"
         )
         if history:
             self.reward_plot.data = tuple(np.asarray(history, dtype=float).T)

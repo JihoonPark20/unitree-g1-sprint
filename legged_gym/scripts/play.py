@@ -1,4 +1,4 @@
-"""Recurrent checkpoint playback; use mjpython for the macOS viewer."""
+"""Policy checkpoint playback; use mjpython for the macOS viewer."""
 
 import time
 

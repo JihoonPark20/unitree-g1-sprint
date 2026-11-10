@@ -96,7 +96,7 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 
 
 def get_args(argv=None, *, mode="train"):
-    parser = argparse.ArgumentParser(description=f"SPRINT {mode}: MuJoCo CPU physics + residual recurrent PPO")
+    parser = argparse.ArgumentParser(description=f"SPRINT {mode}: MuJoCo CPU physics + residual policy training")
     parser.add_argument("--task", default="g1_sprint", choices=["g1_sprint"])
     parser.add_argument("--rl_device", "--rl-device", default="auto")
     parser.add_argument("--num_envs", "--num-envs", type=int, help="Parallel environments (training default: 4096)")
@@ -114,6 +114,8 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--max_grad_norm", type=float)
         parser.add_argument("--desired_kl", type=float)
         parser.add_argument("--learning_rate", type=float)
+        parser.add_argument("--torso_roll_scale", "--torso-roll-scale", type=float,
+                            help="Optional lateral posture penalty: nonpositive reward scale (default: 0)")
         parser.add_argument("--run_name")
         parser.add_argument("--log_interval", "--log-interval", type=int, default=1,
                             help="Terminal progress interval in iterations (default: 1); TensorBoard logs every iteration")
@@ -135,6 +137,8 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--warmup-seconds", type=float, help="Default: max command / acceleration limit + 2 s")
         parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
         parser.add_argument("--save-trajectories", action="store_true", help="Save aligned samples next to the JSON")
+        parser.add_argument("--failure-window", type=float, default=0.0,
+                            help="Save the last N seconds before first failure (0 disables)")
         parser.add_argument("--output", default="outputs/policy_evaluation.json")
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -144,7 +148,9 @@ def get_args(argv=None, *, mode="train"):
     args.play = mode != "train"
     if args.play:
         args.resume = True
-    for name in ("num_envs", "max_iterations", "torch_threads", "steps", "log_interval"):
+    for name in (
+        "num_envs", "max_iterations", "torch_threads", "steps", "log_interval",
+    ):
         value = getattr(args, name, None)
         if value is not None and value <= 0:
             parser.error(f"{name} must be positive")
@@ -152,6 +158,9 @@ def get_args(argv=None, *, mode="train"):
         value = getattr(args, name, None)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"{name} must be finite and positive")
+    roll_scale = getattr(args, "torso_roll_scale", None)
+    if roll_scale is not None and (not math.isfinite(roll_scale) or roll_scale > 0):
+        parser.error("torso_roll_scale must be finite and nonpositive")
     if args.num_threads is not None and args.num_threads < 0:
         parser.error("num_threads must be nonnegative")
     if mode == "play" and (
@@ -202,6 +211,8 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
             env_cfg.env.num_envs = args.num_envs
         if getattr(args, "num_threads", None) is not None:
             env_cfg.sim.nthread = args.num_threads
+        if getattr(args, "torso_roll_scale", None) is not None:
+            env_cfg.rewards.scales = {**env_cfg.rewards.scales, "torso_roll": args.torso_roll_scale}
     if train_cfg is not None:
         for key in ("max_grad_norm", "desired_kl", "learning_rate"):
             value = getattr(args, key, None)
