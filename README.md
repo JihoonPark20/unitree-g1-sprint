@@ -1,5 +1,7 @@
 # SPRINT
 
+![G1 spectral motion references ordered by increasing frequency](docs/assets/teaser.gif)
+
 [한국어](README.ko.md)
 
 Unofficial implementation of [SPRINT](https://arxiv.org/abs/2605.28549) for Unitree G1, following the `legged_gym` structure. Uses MuJoCo CPU simulation and CPU/MPS/CUDA policy training. Paper-level and hardware performance are not validated.

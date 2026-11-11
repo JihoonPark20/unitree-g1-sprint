@@ -1,5 +1,7 @@
 # SPRINT
 
+![보행 주파수 오름차순으로 정렬한 G1 spectral motion reference](docs/assets/teaser.gif)
+
 [English](README.md)
 
 Unitree G1을 위한 [SPRINT](https://arxiv.org/abs/2605.28549)의 비공식 구현입니다. `legged_gym` 구조를 따르며 MuJoCo CPU 시뮬레이션과 CPU/MPS/CUDA 정책 학습을 사용합니다. 논문 수준의 성능과 실기 성능은 검증하지 않았습니다.
