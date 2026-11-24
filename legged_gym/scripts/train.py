@@ -34,7 +34,9 @@ def train(args):
                 ) from error
         runner.learn(
             num_learning_iterations=cfg.runner.max_iterations,
-            init_at_random_ep_len=False,
+            # A resumed run would otherwise restart all envs in lockstep: early stats count only falls and
+            # timeouts arrive in 20 s waves. Fresh runs keep the synchronized start of earlier baselines.
+            init_at_random_ep_len=bool(getattr(args, "resume", False)),
         )
         print(f"Checkpoint: {runner.logger.log_dir}/model_{runner.current_learning_iteration}.pt")
     finally:

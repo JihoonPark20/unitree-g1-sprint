@@ -8,7 +8,8 @@ import torch
 
 from legged_gym.envs.base.legged_robot import SprintRobot, rotate_inverse
 from legged_gym.envs.curriculums import GridAdaptiveCurriculum
-from legged_gym.sim.mujoco_batch import joint_parameters
+from legged_gym.envs.g1_sprint.calibration import kinematic_speed_calibration
+from legged_gym.sim.mujoco_batch import joint_parameters, load_model
 from spectral_prior.reference import ReferenceGenerator
 
 
@@ -50,13 +51,24 @@ class SprintEnv(SprintRobot):
         self.reference = ReferenceGenerator(
             cfg.reference.checkpoint, cfg.asset.joint_names, default, cfg.env.num_envs, cfg.reference.blend_speed
         )
+        calibration = getattr(cfg.reference, "speed_calibration", None)
+        if calibration == "g1_kinematic":
+            self.reference.speed_calibration = kinematic_speed_calibration(
+                load_model(cfg), cfg.asset.joint_names, default, self.reference, cfg.asset.feet,
+                1.0 - cfg.rewards.swing_duty,
+            )
+        elif calibration is not None:
+            raise ValueError(f"Unknown reference.speed_calibration: {calibration}")
         self.q_ref = np.tile(default, (cfg.env.num_envs, 1))
         self.dq_ref = np.zeros_like(self.q_ref)
+        self.q_ref_aligned = self.q_ref.copy()
         self.frequency = np.full(cfg.env.num_envs, 0.6)
         self.filtered_speed = np.zeros(cfg.env.num_envs)
         self.target_position = self.q_ref.copy()
         self.target_velocity = np.zeros_like(self.q_ref)
         self._latency = np.zeros(cfg.env.num_envs, dtype=int)
+        self._lookahead_s = 0.0
+        self._pd_target = self.q_ref.copy()
         self._targets = np.tile(self.q_ref, (cfg.control.max_latency_steps + 1, 1, 1))
         self._target_velocities = np.zeros_like(self._targets)
         self.command_curriculum = None
@@ -68,6 +80,7 @@ class SprintEnv(SprintRobot):
                 np.asarray(cfg.commands.ranges)[[0, 2]], cfg.commands.curriculum_thresholds,
                 cfg.commands.curriculum_increment, cfg.commands.curriculum_local_range,
                 progress=getattr(cfg.commands, "curriculum_progress", None),
+                focus=getattr(cfg.commands, "curriculum_focus", None),
             )
             if (
                 not np.isfinite([cfg.commands.acceleration_limit, cfg.commands.curriculum_min_settled_s,
@@ -81,6 +94,10 @@ class SprintEnv(SprintRobot):
         self._command_score_sums = np.zeros((cfg.env.num_envs, 2))
         self._command_motion_sums = np.zeros((cfg.env.num_envs, 3))
         self._command_settled_steps = np.zeros(cfg.env.num_envs, dtype=int)
+        # Cycle-averaged linear score: open-cycle speed error / steps, and steps of the segment's completed cycles.
+        self._cycle_error_sums = np.zeros(cfg.env.num_envs)
+        self._cycle_steps = np.zeros(cfg.env.num_envs, dtype=int)
+        self._command_cycle_steps = np.zeros(cfg.env.num_envs, dtype=int)
         self.record_evaluation = False
         self.record_failure_trace = False
         super().__init__(cfg, **kwargs)
@@ -129,7 +146,13 @@ class SprintEnv(SprintRobot):
         # Target is held over decimation; PD feedback is recomputed at 200 Hz.
         pos = self.sim.qpos[:, self.sim.qpos_ids]
         vel = self.sim.qvel[:, self.sim.qvel_ids]
-        torque = self.p_gains * (self.target_position - pos) + self.d_gains * (self.target_velocity - vel)
+        target = self.target_position
+        if getattr(self.cfg.control, "reference_lookahead", False):
+            # Move the held target along the reference so the P and D terms agree within the control interval.
+            limits = self.sim.model.jnt_range[self.sim.joint_ids]
+            target = np.clip(target + self.target_velocity * self._lookahead_s, limits[:, 0], limits[:, 1])
+        self._pd_target = target
+        torque = self.p_gains * (target - pos) + self.d_gains * (self.target_velocity - vel)
         return np.clip(torque, -self.torque_limits, self.torque_limits)
 
     def step(self, actions):
@@ -179,9 +202,10 @@ class SprintEnv(SprintRobot):
             step_saturation = np.zeros_like(self.torques)
             step_torque_peak = np.zeros_like(self.torques)
         for substep in range(self.cfg.control.decimation):
+            self._lookahead_s = (substep + 1) * self.cfg.sim.dt
             self.torques[:] = self._compute_torques(self.actions)
             if self.record_failure_trace:
-                p_torque = self.p_gains * (self.target_position - self.sim.qpos[:, self.sim.qpos_ids])
+                p_torque = self.p_gains * (self._pd_target - self.sim.qpos[:, self.sim.qpos_ids])
                 d_torque = self.d_gains * (self.target_velocity - self.sim.qvel[:, self.sim.qvel_ids])
                 requested_torque = p_torque + d_torque
                 step_saturation += (np.abs(self.torques) >= 0.99 * self.torque_limits) / self.cfg.control.decimation
@@ -195,6 +219,8 @@ class SprintEnv(SprintRobot):
         self.episode_length_buf += 1
         self._refresh_state()
         self.check_termination()
+        # Reference at the post-step state's instant (t+dt), before the phase advances.
+        self.q_ref_aligned = self.reference.evaluate(self.filtered_speed, time_offset=self.dt)[0]
         # Evaluate the reference and command that actually produced this transition.
         self.compute_reward()
         self._record_tracking_diagnostics()
@@ -307,7 +333,8 @@ class SprintEnv(SprintRobot):
 
     def _record_tracking_diagnostics(self):
         indices = self.reference.indices
-        self._diagnostic_sums[:, 3] += np.abs(self.dof_pos[:, indices] - self.q_ref[:, indices]).mean(1)
+        # Same-instant error regardless of the reward setting, so runs stay comparable.
+        self._diagnostic_sums[:, 3] += np.abs(self.dof_pos[:, indices] - self.q_ref_aligned[:, indices]).mean(1)
         forward = self._forward_velocity()
         self._diagnostic_sums[:, 4] += np.abs(self.filtered_speed - forward)
         self._diagnostic_sums[:, 5] += np.abs(self.commands[:, 2] - self.base_ang_vel[:, 2])
@@ -328,6 +355,9 @@ class SprintEnv(SprintRobot):
         self._command_score_sums[ids] = 0
         self._command_motion_sums[ids] = 0
         self._command_settled_steps[ids] = 0
+        self._cycle_error_sums[ids] = 0
+        self._cycle_steps[ids] = 0
+        self._command_cycle_steps[ids] = 0
         self._command_bins[ids] = -1
         self._command_crossed[ids] = False
         if self.command_curriculum is None or not self.cfg.commands.curriculum:
@@ -350,7 +380,22 @@ class SprintEnv(SprintRobot):
         )
         self._command_settled_steps[settled] += 1
         # Unweighted kernels avoid coupling success thresholds to reward tuning.
-        self._command_score_sums[settled, 0] += self._reward_tracking_lin_vel()[settled]
+        if getattr(self.cfg.commands, "curriculum_cycle_average", False):
+            self._cycle_error_sums[settled] += (self.filtered_speed - self._forward_velocity())[settled]
+            self._cycle_steps[settled] += 1
+            self._cycle_error_sums[~settled] = 0  # A scored cycle must be settled throughout.
+            self._cycle_steps[~settled] = 0
+            # The phase wraps on this step's advance: credit the cycle-mean kernel to each of its steps.
+            wraps = self.reference.phase.numpy() + self.reference.frequency(self.filtered_speed).numpy() * self.dt >= 1
+            done = settled & wraps
+            steps = self._cycle_steps[done]
+            mean_error = self._cycle_error_sums[done] / steps
+            self._command_score_sums[done, 0] += steps * np.exp(-np.square(mean_error) / self.cfg.rewards.tracking_sigma)
+            self._command_cycle_steps[done] += steps
+            self._cycle_error_sums[done] = 0
+            self._cycle_steps[done] = 0
+        else:
+            self._command_score_sums[settled, 0] += self._reward_tracking_lin_vel()[settled]
         self._command_score_sums[settled, 1] += self._reward_tracking_ang_vel()[settled]
         forward = self._forward_velocity()[settled]
         self._command_motion_sums[settled, 0] += forward
@@ -361,7 +406,9 @@ class SprintEnv(SprintRobot):
         if not len(ids) or self.command_curriculum is None or not self.cfg.commands.curriculum:
             return
         counts = self._command_settled_steps[ids]
-        scores = self._command_score_sums[ids] / np.maximum(counts[:, None], 1)
+        # Cycle mode: the linear score covers completed cycles only (none -> 0, cannot promote).
+        linear_counts = self._command_cycle_steps[ids] if getattr(self.cfg.commands, "curriculum_cycle_average", False) else counts
+        scores = self._command_score_sums[ids] / np.maximum(np.column_stack((linear_counts, counts)), 1)
         eligible = (counts * self.dt + 1e-12 >= self.cfg.commands.curriculum_min_settled_s) & ~self.terminated_buf[ids]
         # A crossing near a segment boundary must not promote before the
         # consecutive-step termination timer has had time to expire.
@@ -372,6 +419,9 @@ class SprintEnv(SprintRobot):
         self._command_score_sums[ids] = 0
         self._command_motion_sums[ids] = 0
         self._command_settled_steps[ids] = 0
+        self._cycle_error_sums[ids] = 0
+        self._cycle_steps[ids] = 0
+        self._command_cycle_steps[ids] = 0
         self._command_bins[ids] = -1
         self._command_crossed[ids] = False
 
@@ -396,7 +446,9 @@ class SprintEnv(SprintRobot):
 
     def _reward_prior(self):
         ids = self.reference.indices
-        return np.exp(-np.square(self.dof_pos[:, ids] - self.q_ref[:, ids]) / self.cfg.rewards.prior_sigma).sum(1)
+        aligned = getattr(self.cfg.reference, "prior_reward_time_aligned", False)
+        q_ref = self.q_ref_aligned if aligned else self.q_ref
+        return np.exp(-np.square(self.dof_pos[:, ids] - q_ref[:, ids]) / self.cfg.rewards.prior_sigma).sum(1)
 
     def _reward_tracking_ang_vel(self):
         return np.exp(-np.square(self.commands[:, 2] - self.base_ang_vel[:, 2]) / self.cfg.rewards.tracking_ang_sigma)
@@ -416,8 +468,11 @@ class SprintEnv(SprintRobot):
 
     def _reward_air_height(self):
         height = self.feet_pos[:, :, 2] - self.feet_ground_height
+        airborne = ~self._feet_contact
+        if getattr(self.cfg.rewards, "air_height_swing_cap", False):
+            airborne &= self.feet_air_time <= (self.cfg.rewards.swing_duty / self.frequency)[:, None]
         reward = (
-            (~self._feet_contact)
+            airborne
             * np.exp(-np.abs(height - self.cfg.rewards.feet_clearance_target) / self.cfg.rewards.feet_clearance_std)
         ).sum(1)
         if getattr(self.cfg.rewards, "air_height_command_gate", False):

@@ -12,7 +12,8 @@ import numpy as np
 
 
 class GridAdaptiveCurriculum:
-    def __init__(self, limits, bin_widths, initial_ranges, thresholds, increment=0.2, local_range=None, progress=None):
+    def __init__(self, limits, bin_widths, initial_ranges, thresholds, increment=0.2, local_range=None, progress=None,
+                 focus=None):
         self.limits = np.asarray(limits, dtype=float)
         widths = np.asarray(bin_widths, dtype=float)
         initial = np.asarray(initial_ranges, dtype=float)
@@ -22,7 +23,8 @@ class GridAdaptiveCurriculum:
         if self.progress is not None and (
             set(self.progress) != {"min_command", "min_speed_ratio", "max_forward_mae", "max_yaw_mae"}
             or not all(
-                (key == "max_yaw_mae" and value is None) or (value is not None and np.isfinite(value) and value > 0)
+                (key in ("max_forward_mae", "max_yaw_mae") and value is None)
+                or (value is not None and np.isfinite(value) and value > 0)
                 for key, value in self.progress.items()
             )
             or self.progress["min_speed_ratio"] > 1
@@ -58,10 +60,30 @@ class GridAdaptiveCurriculum:
         self.trials = np.zeros(len(active), dtype=np.int64)
         self.successes = np.zeros(len(active), dtype=np.int64)
         self.score_sums = np.zeros((len(active), 2))
+        # Optional extra practice inside a forward-speed band: {"range": [lo, hi], "fraction": f}.
+        # Not part of RLvRL; promotion rules are unchanged and the band is used only once its cells are active.
+        self.focus = None if focus is None else {"range": [float(x) for x in focus["range"]], "fraction": float(focus["fraction"])}
+        if self.focus is not None:
+            lo, hi = self.focus["range"]
+            if not (self.limits[0, 0] <= lo < hi <= self.limits[0, 1] and 0 < self.focus["fraction"] <= 1):
+                raise ValueError("Invalid curriculum focus band")
+        self._vx_edges = edges[0]
 
     def sample(self, rng, size):
         bins = rng.choice(len(self.weights), size=size, p=self.weights / self.weights.sum())
-        return rng.uniform(self.low[bins], self.high[bins]), bins
+        values = rng.uniform(self.low[bins], self.high[bins])
+        if self.focus is not None:
+            lo, hi = self.focus["range"]
+            if self._band_active(lo, hi):
+                pick = rng.random(size) < self.focus["fraction"]
+                values[pick, 0] = rng.uniform(lo, hi, pick.sum())
+                ix = np.clip(np.searchsorted(self._vx_edges, values[pick, 0], side="right") - 1, 0, self.shape[0] - 1)
+                bins[pick] = ix * self.shape[1] + bins[pick] % self.shape[1]  # Same yaw cell, vx cell of the new value.
+        return values, bins
+
+    def _band_active(self, lo, hi):
+        cells = (self.high[:, 0] > lo) & (self.low[:, 0] < hi)
+        return bool(np.all(self.weights[cells] > 0))
 
     def update(self, bins, scores, eligible, motion=None):
         """Credit completed command segments; scores are unweighted mean kernels.
@@ -84,9 +106,9 @@ class GridAdaptiveCurriculum:
                 raise ValueError("Progress curriculum requires finite command / motion measurements")
             command, forward, vx_error, yaw_error = motion.T
             p = self.progress
-            eligible = eligible & (command >= p["min_command"]) & (
-                forward >= p["min_speed_ratio"] * command
-            ) & (vx_error <= p["max_forward_mae"])
+            eligible = eligible & (command >= p["min_command"]) & (forward >= p["min_speed_ratio"] * command)
+            if p["max_forward_mae"] is not None:
+                eligible &= vx_error <= p["max_forward_mae"]
             if p["max_yaw_mae"] is not None:
                 eligible &= yaw_error <= p["max_yaw_mae"]
         valid = bins >= 0

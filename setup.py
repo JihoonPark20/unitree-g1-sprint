@@ -47,6 +47,7 @@ setup(
             "sprint-play=legged_gym.scripts.play:main",
             "sprint-evaluate=legged_gym.scripts.evaluate:main",
             "sprint-reference=legged_gym.scripts.reference:main",
+            "sprint-diagnose=legged_gym.scripts.diagnose:main",
         ]
     },
 )

@@ -10,6 +10,7 @@ from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 
+import numpy as np
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
@@ -57,6 +58,12 @@ def policy_contract(env):
         contract["residual_limits_rad"] = env.residual_limits.tolist()
     if getattr(env.cfg.control, "reference_velocity", False):
         contract["reference_velocity"] = "phase_central_difference"
+    if getattr(env.cfg.control, "reference_lookahead", False):
+        contract["reference_lookahead"] = "velocity_interpolated_substeps"
+    calibration = getattr(env.reference, "speed_calibration", None) if hasattr(env, "reference") else None
+    if calibration is not None:
+        contract["prior_speed_calibration"] = {"robot_speeds": np.round(calibration[0], 3).tolist(),
+                                               "prior_speeds": np.round(calibration[1], 3).tolist()}
     return contract
 
 
@@ -119,8 +126,15 @@ class LeggedOnPolicyRunner(OnPolicyRunner):
     def load(self, path, load_cfg=None, strict=True, map_location=None, *, restore_env=True):
         checkpoint = torch.load(path, weights_only=False, map_location="cpu")
         metadata = (checkpoint.get("infos") or {}).get("legged_gym")
+        saved = (metadata or {}).get("contract", {})
+        # Action bounds may only widen: every action the saved policy could issue then maps to the same PD target.
+        widened = lambda key, value: (
+            saved.get(key) is not None and np.shape(saved[key]) == np.shape(value)
+            and bool(np.all(np.asarray(value) >= np.asarray(saved[key])))
+        )
         if metadata is None or any(
-            metadata.get("contract", {}).get(key) != value for key, value in policy_contract(self.env).items()
+            saved.get(key) != value and not (key in ("clip_actions", "residual_limits_rad") and widened(key, value))
+            for key, value in policy_contract(self.env).items()
         ):
             raise ValueError("Checkpoint policy contract does not match this robot/configuration")
         del checkpoint
@@ -195,8 +209,14 @@ class TaskRegistry:
                 env_cfg.rewards.signed_feet_distance = snapshot["env"]["rewards"].get("signed_feet_distance", False)
                 env_cfg.rewards.air_height_command_gate = snapshot["env"]["rewards"].get("air_height_command_gate", False)
                 env_cfg.termination.terminate_on_feet_crossing = snapshot["env"]["termination"].get("terminate_on_feet_crossing", False)
+                env_cfg.reference.prior_reward_time_aligned = snapshot["env"]["reference"].get(
+                    "prior_reward_time_aligned", False)
+                env_cfg.control.reference_lookahead = snapshot["env"]["control"].get("reference_lookahead", False)
+                env_cfg.rewards.air_height_swing_cap = snapshot["env"]["rewards"].get("air_height_swing_cap", False)
+                env_cfg.reference.speed_calibration = snapshot["env"]["reference"].get("speed_calibration")
                 if hasattr(train_cfg, "policy"):
                     train_cfg.policy.noise_std_range = snapshot["train"]["policy"].get("noise_std_range", [1e-6, 1e6])
+                    train_cfg.policy.obs_normalization = snapshot["train"]["policy"].get("obs_normalization", False)
                 if legacy_rewards:
                     # Old policies used one shared width for both tracking terms.
                     env_cfg.rewards.tracking_ang_sigma = env_cfg.rewards.tracking_sigma

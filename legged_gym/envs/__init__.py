@@ -30,7 +30,10 @@
 
 from legged_gym.utils.task_registry import task_registry
 
-from .g1_sprint.config import SprintCfg, SprintPPOCfg
+from .g1_sprint.config import SPRINT_TASKS
 from .g1_sprint.env import SprintEnv
 
-task_registry.register("g1_sprint", SprintEnv, SprintCfg(), SprintPPOCfg())
+for _name, (_env_cfg, _train_cfg) in SPRINT_TASKS.items():
+    _train = _train_cfg()
+    _train.runner.experiment_name = _name  # logs/<task>/ keeps runs apart.
+    task_registry.register(_name, SprintEnv, _env_cfg(), _train)

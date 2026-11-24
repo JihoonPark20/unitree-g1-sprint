@@ -1,6 +1,7 @@
 """Configuration, CLI and device helpers for the MuJoCo training path."""
 
 import argparse
+import json
 import math
 import random
 from pathlib import Path
@@ -97,7 +98,7 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 
 def get_args(argv=None, *, mode="train"):
     parser = argparse.ArgumentParser(description=f"SPRINT {mode}: MuJoCo CPU physics + residual policy training")
-    parser.add_argument("--task", default="g1_sprint", choices=["g1_sprint"])
+    parser.add_argument("--task", default="g1_sprint", help="Registered task; see SPRINT_TASKS")
     parser.add_argument("--rl_device", "--rl-device", default="auto")
     parser.add_argument("--num_envs", "--num-envs", type=int, help="Parallel environments (training default: 4096)")
     parser.add_argument("--num_threads", "--num-threads", type=int, help="MuJoCo worker threads (default: 10)")
@@ -116,6 +117,13 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--learning_rate", type=float)
         parser.add_argument("--torso_roll_scale", "--torso-roll-scale", type=float,
                             help="Optional lateral posture penalty: nonpositive reward scale (default: 0)")
+        parser.add_argument("--curriculum-focus", nargs=3, type=float, metavar=("LO", "HI", "FRACTION"),
+                            help="Also sample this fraction of commands uniformly in [LO, HI] m/s once those cells are active (FRACTION 0: off)")
+        parser.add_argument("--curriculum-cycle-average", action="store_true", default=None,
+                            help="Score curriculum speed tracking on each gait cycle's mean speed (not in RLvRL; off by default)")
+        parser.add_argument("--residual-limits", type=json.loads, metavar="JSON",
+                            help='Per-joint residual bounds in rad, regex -> value, later entries win, e.g. '
+                                 '\'{".*": 0.5, ".*_knee_joint": 0.8}\'; replaces the configured/snapshot bounds')
         parser.add_argument("--run_name")
         parser.add_argument("--log_interval", "--log-interval", type=int, default=1,
                             help="Terminal progress interval in iterations (default: 1); TensorBoard logs every iteration")
@@ -213,6 +221,17 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
             env_cfg.sim.nthread = args.num_threads
         if getattr(args, "torso_roll_scale", None) is not None:
             env_cfg.rewards.scales = {**env_cfg.rewards.scales, "torso_roll": args.torso_roll_scale}
+        if getattr(args, "curriculum_focus", None) is not None:
+            lo, hi, fraction = args.curriculum_focus
+            # FRACTION 0 turns a focus inherited from the resumed snapshot off.
+            env_cfg.commands.curriculum_focus = {"range": [lo, hi], "fraction": fraction} if fraction > 0 else None
+        if getattr(args, "residual_limits", None) is not None:
+            env_cfg.control.residual_limits = args.residual_limits
+            # clip_actions is a second, uniform bound; keep it from silently capping the wider residuals.
+            widest = max(args.residual_limits.values()) / env_cfg.control.action_scale
+            env_cfg.control.clip_actions = max(env_cfg.control.clip_actions, widest)
+        if getattr(args, "curriculum_cycle_average", None):
+            env_cfg.commands.curriculum_cycle_average = True
     if train_cfg is not None:
         for key in ("max_grad_norm", "desired_kl", "learning_rate"):
             value = getattr(args, key, None)
