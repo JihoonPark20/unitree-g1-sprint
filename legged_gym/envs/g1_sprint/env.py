@@ -59,6 +59,11 @@ class SprintEnv(SprintRobot):
             )
         elif calibration is not None:
             raise ValueError(f"Unknown reference.speed_calibration: {calibration}")
+        self._target_interp = getattr(cfg.control, "target_interp", None)
+        if self._target_interp not in (None, "zoh", "linear", "exact"):
+            raise ValueError("target_interp must be None, zoh, linear, or exact")
+        self._legacy_lookahead = self._target_interp is None and getattr(cfg.control, "reference_lookahead", False)
+        self._substep_history = None
         self.q_ref = np.tile(default, (cfg.env.num_envs, 1))
         self.dq_ref = np.zeros_like(self.q_ref)
         self.q_ref_aligned = self.q_ref.copy()
@@ -101,13 +106,14 @@ class SprintEnv(SprintRobot):
         self.evaluation_latency_steps = None
         self.evaluation_impulse = None
         self._evaluation_history = None
+        self._last_eval_reference = None
         self.record_evaluation = False
         self.record_failure_trace = False
         super().__init__(cfg, **kwargs)
         self._foot_quat = self.sim.batch.bind("xquat")
 
     def _update_reference(self):
-        if getattr(self.cfg.control, "reference_velocity", False):
+        if getattr(self.cfg.control, "reference_velocity", False) or self._target_interp in ("linear", "exact"):
             self.q_ref[:], self.dq_ref[:], self.frequency[:] = self.reference.evaluate_with_velocity(
                 self.filtered_speed, self.cfg.sim.dt,
             )
@@ -150,8 +156,57 @@ class SprintEnv(SprintRobot):
             ref[:, ids] = self.q_ref[ids]
             vel[:, ids] = 0
             residual[:, ids] = 0
+        if self._last_eval_reference is not None:
             self._last_eval_reference[ids] = np.nan
             self._last_eval_offset[ids] = np.nan
+
+        if self._target_interp is not None and len(self._targets) > 1:
+            depth = len(self._targets)
+            if self._substep_history is None:
+                shape = (depth, self.num_envs, self.cfg.control.decimation, self.num_dof)
+                self._substep_history = (np.zeros(shape), np.zeros(shape), np.zeros((depth, *self.actions.shape)))
+            elif len(self._substep_history[0]) < depth:
+                self._substep_history = tuple(
+                    np.concatenate((h, np.repeat(h[-1:], depth - len(h), axis=0))) for h in self._substep_history
+                )
+            positions, velocities, inputs = self._substep_history
+            positions[:, ids] = self.q_ref[ids, None]
+            velocities[:, ids] = 0
+            inputs[:, ids] = 0
+
+    def _issue_substep_targets(self, control_input):
+        count = self.cfg.control.decimation
+        dt = self.cfg.sim.dt
+        if self._target_interp == "exact":
+            position, velocity = self.reference.evaluate_substeps(self.filtered_speed, dt, count)
+        else:
+            shape = (self.num_envs, count, self.num_dof)
+            position = np.broadcast_to(self.q_ref[:, None], shape)
+            velocity = np.broadcast_to(self.dq_ref[:, None], shape)
+            if self._target_interp == "linear":
+                times = (dt * np.arange(1, count + 1))[None, :, None]
+                position = position + times * velocity
+        packet = (position, velocity, control_input)
+        if self._substep_history is None:
+            return packet
+        rows = np.arange(self.num_envs)
+        for history, value in zip(self._substep_history, packet):
+            history[1:] = history[:-1].copy()
+            history[0] = value
+        return tuple(history[self._latency, rows] for history in self._substep_history)
+
+    def _apply_substep_target(self, reference, velocity, residual, limits):
+        self.target_position[:] = reference
+        self.target_position[:, self.action_dof_indices] += residual
+        self.target_position[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
+        self.target_velocity[:] = velocity
+        self.target_velocity[:, self.held_dof_indices] = 0
+        lower, upper = limits.T
+        outside = (self.target_position < lower) | (self.target_position > upper)
+        self._diagnostic_sums[:, 2] += outside.mean(1) / self.cfg.control.decimation
+        self.target_velocity[((self.target_position <= lower) & (self.target_velocity < 0))
+                             | ((self.target_position >= upper) & (self.target_velocity > 0))] = 0
+        np.clip(self.target_position, lower, upper, out=self.target_position)
 
     def check_termination(self):
         super().check_termination()
@@ -172,7 +227,7 @@ class SprintEnv(SprintRobot):
         pos = self.sim.qpos[:, self.sim.qpos_ids]
         vel = self.sim.qvel[:, self.sim.qvel_ids]
         target = self.target_position
-        if getattr(self.cfg.control, "reference_lookahead", False):
+        if self._legacy_lookahead:
             # Move the held target along the reference so the P and D terms agree within the control interval.
             limits = self.sim.model.jnt_range[self.sim.joint_ids]
             target = np.clip(target + self.target_velocity * self._lookahead_s, limits[:, 0], limits[:, 1])
@@ -180,12 +235,21 @@ class SprintEnv(SprintRobot):
         torque = self.p_gains * (target - pos) + self.d_gains * (self.target_velocity - vel)
         return np.clip(torque, -self.torque_limits, self.torque_limits)
 
+    def _hold_target(self, target, limits):
+        self._targets[1:] = self._targets[:-1].copy()
+        self._targets[0] = np.clip(target, limits[:, 0], limits[:, 1])
+        velocity = self.dq_ref.copy()
+        velocity[:, self.held_dof_indices] = 0
+        velocity[((target <= limits[:, 0]) & (velocity < 0)) | ((target >= limits[:, 1]) & (velocity > 0))] = 0
+        self._target_velocities[1:] = self._target_velocities[:-1].copy()
+        self._target_velocities[0] = velocity
+        self.target_position[:] = self._targets[self._latency, np.arange(self.num_envs)]
+        self.target_velocity[:] = self._target_velocities[self._latency, np.arange(self.num_envs)]
+
     def _evaluation_inputs(self, residual, limits):
         if self._evaluation_history is None:
             shape = (*self._targets.shape[:2], residual.shape[-1])
             self._evaluation_history = (self._targets.copy(), self._target_velocities.copy(), np.zeros(shape))
-            self._last_eval_reference = np.full_like(self.q_ref, np.nan)
-            self._last_eval_offset = np.full_like(self.q_ref, np.nan)
         reference = self.q_ref.copy()
         reference[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
         velocity = self.dq_ref.copy()
@@ -235,15 +299,23 @@ class SprintEnv(SprintRobot):
         self._joint_residual_sums[:, 2] += clipped
         self._diagnostic_sums[:, 0] += np.sqrt(np.square(residual).mean(1))
         self._diagnostic_sums[:, 1] += clipped.mean(1)
-        target = self.q_ref.copy()
-        target[:, self.action_dof_indices] += residual
-        # Wrist joints remain physical: PD holds a fixed pose under external loads.
-        target[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
-        # Joint constraints apply to the combined reference+residual, not either separately.
         limits = self.sim.model.jnt_range[self.sim.joint_ids]
-        self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
+        packet = None
+        if self._target_interp is None:
+            target = self.q_ref.copy()
+            target[:, self.action_dof_indices] += residual
+            target[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
+            self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
+        else:
+            packet = self._issue_substep_targets(residual)
         if self.record_evaluation:
-            eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
+            if self._last_eval_reference is None:
+                self._last_eval_reference = np.full_like(self.q_ref, np.nan)
+                self._last_eval_offset = np.full_like(self.q_ref, np.nan)
+            if packet is None:
+                eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
+            else:
+                eval_residual = packet[2]
             shape = (self.cfg.control.decimation, *self.torques.shape)
             trace = {
                 "requested_torque": np.empty(shape),
@@ -254,15 +326,8 @@ class SprintEnv(SprintRobot):
                 "action_clipped": clipped.copy(),
                 "anti_windup": np.zeros((shape[0], *eval_residual.shape), dtype=bool),
             }
-        self._targets[1:] = self._targets[:-1].copy()
-        self._targets[0] = np.clip(target, limits[:, 0], limits[:, 1])
-        velocity = self.dq_ref.copy()
-        velocity[:, self.held_dof_indices] = 0
-        velocity[((target <= limits[:, 0]) & (velocity < 0)) | ((target >= limits[:, 1]) & (velocity > 0))] = 0
-        self._target_velocities[1:] = self._target_velocities[:-1].copy()
-        self._target_velocities[0] = velocity
-        self.target_position[:] = self._targets[self._latency, np.arange(self.num_envs)]
-        self.target_velocity[:] = self._target_velocities[self._latency, np.arange(self.num_envs)]
+        if packet is None:
+            self._hold_target(target, limits)
         self._push_robots()
         self._first_contact.fill(False)
         self._touchdown_air_time.fill(0)
@@ -271,6 +336,9 @@ class SprintEnv(SprintRobot):
             step_torque_peak = np.zeros_like(self.torques)
         for substep in range(self.cfg.control.decimation):
             self._lookahead_s = (substep + 1) * self.cfg.sim.dt
+            if packet is not None:
+                reference = packet[0][:, substep]
+                self._apply_substep_target(reference, packet[1][:, substep], packet[2], limits)
             self.torques[:] = self._compute_torques(self.actions)
             if self.record_evaluation or self.record_failure_trace:
                 joint_velocity = self.sim.qvel[:, self.sim.qvel_ids]
@@ -281,9 +349,13 @@ class SprintEnv(SprintRobot):
                 trace["requested_torque"][substep] = requested_torque
                 trace["applied_torque"][substep] = self.torques
                 trace["joint_velocity"][substep] = joint_velocity
-                neutral = eval_ref
-                if getattr(self.cfg.control, "reference_lookahead", False):
+                if packet is not None:
+                    neutral = np.clip(reference, limits[:, 0], limits[:, 1])
+                    neutral[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
+                elif self._legacy_lookahead:
                     neutral = np.clip(eval_ref + eval_velocity * self._lookahead_s, limits[:, 0], limits[:, 1])
+                else:
+                    neutral = eval_ref
                 offset = self._pd_target - neutral
                 if substep == 0:
                     trace["p_jump_reference"] = self.p_gains * (neutral - self._last_eval_reference)
@@ -367,7 +439,7 @@ class SprintEnv(SprintRobot):
                     "forward_velocity": extras["evaluation"]["forward_velocity"].copy(),
                     "issued_residual_rad": residual.copy(),
                     "joint_pos_rad": self.dof_pos[:, self.action_dof_indices].copy(),
-                    "pd_target_rad": self.target_position[:, self.action_dof_indices].copy(),
+                    "pd_target_rad": self._pd_target[:, self.action_dof_indices].copy(),
                     "joint_velocity_rad_s": self.dof_vel[:, self.action_dof_indices].copy(),
                     "pd_target_velocity_rad_s": self.target_velocity[:, self.action_dof_indices].copy(),
                     "torque_last_substep_Nm": self.torques[:, self.action_dof_indices].copy(),

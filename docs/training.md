@@ -96,3 +96,12 @@ Each milestone uses a 10-iteration rolling mean. `compare` also reports final tr
 
 Run `sprint-reference --headless` for one second of reference playback. Use
 `--source prior --mode pd` to exercise torque-limited suspended PD tracking.
+
+`control.target_interp` selects the position target within each 50 Hz policy step.
+The default `None` retains the checkpoint's `reference_lookahead` setting. In
+the stock `g1_sprint` task this advances the held target by 5, 10, 15 and 20 ms
+along the reference velocity. Explicit `zoh` holds the position fixed.
+Explicit `linear` extrapolates the issued reference at the same four offsets
+before adding the residual and enforcing joint limits. `exact` evaluates the
+frozen prior at each offset and uses a 5 ms centered difference there for the
+velocity target. A delayed command retains its original reference and residual.

@@ -60,3 +60,14 @@ class ReferenceGenerator:
         before, _ = self.evaluate(speed, time_offset=-0.5 * dt)
         after, _ = self.evaluate(speed, time_offset=0.5 * dt)
         return position, (after - before) / dt, frequency
+
+    def evaluate_substeps(self, speed, dt, count):
+        """Positions and central-difference velocities at dt, 2dt, ... from the issued phase."""
+        positions, velocities = [], []
+        before = self.evaluate(speed, time_offset=0.5 * dt)[0]
+        for k in range(1, count + 1):
+            positions.append(self.evaluate(speed, time_offset=k * dt)[0])
+            after = self.evaluate(speed, time_offset=(k + 0.5) * dt)[0]
+            velocities.append((after - before) / dt)
+            before = after
+        return np.stack(positions, axis=1), np.stack(velocities, axis=1)
