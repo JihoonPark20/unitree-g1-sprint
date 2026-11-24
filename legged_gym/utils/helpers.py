@@ -110,6 +110,9 @@ def get_args(argv=None, *, mode="train"):
     parser.add_argument("--checkpoint", type=int, default=-1)
     parser.add_argument("--experiment_name")
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (Viser during training)")
+    if mode in ("train", "evaluate"):
+        parser.add_argument("--latency-steps", type=int, choices=(0, 1, 2),
+                            help="Use exactly this many policy ticks of controller input delay")
     if mode == "train":
         parser.add_argument("--max_iterations", "--max-iterations", type=int)
         parser.add_argument("--max_grad_norm", type=float)
@@ -140,6 +143,10 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--camera-distance", type=float, default=3.0, help="Initial camera distance in meters")
         parser.add_argument("--camera-height", type=float, default=0.0, help="Look-at height relative to the pelvis")
     elif mode == "evaluate":
+        parser.add_argument("--push-impulse", type=float, default=0, metavar="NS",
+                            help="Single lateral pelvis impulse in N s at the first measured tick")
+        parser.add_argument("--calibrate-push", action="store_true",
+                            help="Find an impulse giving approximately 50%% survival at 3 m/s for an A0 checkpoint")
         parser.add_argument("--speeds", nargs="+", type=float, default=[i / 10 for i in range(61)])
         parser.add_argument("--seconds", type=float, default=20, help="Measurement duration after warmup")
         parser.add_argument("--warmup-seconds", type=float, help="Default: max command / acceleration limit + 2 s")
@@ -191,7 +198,9 @@ def get_args(argv=None, *, mode="train"):
     ):
         parser.error("Velocity requires VX in [0,6], VY=0, WZ in [-0.7,0.7]")
     if mode == "evaluate" and (
-        not math.isfinite(args.seconds)
+        not math.isfinite(args.push_impulse) or args.push_impulse < 0
+        or (args.calibrate_push and args.push_impulse != 0)
+        or not math.isfinite(args.seconds)
         or args.seconds <= 0
         or any(not 0 <= v <= 6 for v in args.speeds)
         or (args.warmup_seconds is not None and (not math.isfinite(args.warmup_seconds) or args.warmup_seconds < 0))
@@ -200,7 +209,7 @@ def get_args(argv=None, *, mode="train"):
         or any(seed < 0 for seed in args.seeds)
     ):
         parser.error(
-            "Require positive finite seconds, nonnegative warmup/seeds, unique speeds in [0,6] and unique seeds"
+            "Require nonnegative finite impulse/warmup, positive seconds, unique valid speeds/seeds, and a zero starting impulse for calibration"
         )
     try:
         args.rl_device = resolve_rl_device(args.rl_device)
@@ -215,6 +224,9 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
         if cfg is not None and getattr(args, "seed", None) is not None:
             cfg.seed = args.seed
     if env_cfg is not None:
+        if getattr(args, "latency_steps", None) is not None and not getattr(args, "play", False):
+            env_cfg.control.max_latency_steps = args.latency_steps
+            env_cfg.control.fixed_latency_steps = args.latency_steps
         if getattr(args, "num_envs", None) is not None:
             env_cfg.env.num_envs = args.num_envs
         if getattr(args, "num_threads", None) is not None:

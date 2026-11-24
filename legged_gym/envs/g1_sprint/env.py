@@ -98,6 +98,9 @@ class SprintEnv(SprintRobot):
         self._cycle_error_sums = np.zeros(cfg.env.num_envs)
         self._cycle_steps = np.zeros(cfg.env.num_envs, dtype=int)
         self._command_cycle_steps = np.zeros(cfg.env.num_envs, dtype=int)
+        self.evaluation_latency_steps = None
+        self.evaluation_impulse = None
+        self._evaluation_history = None
         self.record_evaluation = False
         self.record_failure_trace = False
         super().__init__(cfg, **kwargs)
@@ -121,12 +124,34 @@ class SprintEnv(SprintRobot):
         self.feet_crossing_buf[ids] = False
         self.filtered_speed[ids] = 0
         self.reference.reset(ids)
-        self._latency[ids] = self.rng.integers(0, self.cfg.control.max_latency_steps + 1, len(ids))
+        delay = self.evaluation_latency_steps
+        if delay is None:
+            delay = getattr(self.cfg.control, "fixed_latency_steps", None)
+        if delay is None:
+            self._latency[ids] = self.rng.integers(0, self.cfg.control.max_latency_steps + 1, len(ids))
+        else:
+            if delay not in (0, 1, 2):
+                raise ValueError("Fixed latency must be 0, 1, or 2 policy steps")
+            if delay >= len(self._targets):
+                extra = delay + 1 - len(self._targets)
+                self._targets = np.concatenate((self._targets, np.repeat(self._targets[-1:], extra, axis=0)))
+                self._target_velocities = np.concatenate((
+                    self._target_velocities, np.repeat(self._target_velocities[-1:], extra, axis=0),
+                ))
+                self._evaluation_history = None
+            self._latency[ids] = delay
         self._update_reference()
         self.target_position[ids] = self.q_ref[ids]
         self._targets[:, ids] = self.q_ref[ids]
         self.target_velocity[ids] = 0
         self._target_velocities[:, ids] = 0
+        if self._evaluation_history is not None:
+            ref, vel, residual = self._evaluation_history
+            ref[:, ids] = self.q_ref[ids]
+            vel[:, ids] = 0
+            residual[:, ids] = 0
+            self._last_eval_reference[ids] = np.nan
+            self._last_eval_offset[ids] = np.nan
 
     def check_termination(self):
         super().check_termination()
@@ -154,6 +179,37 @@ class SprintEnv(SprintRobot):
         self._pd_target = target
         torque = self.p_gains * (target - pos) + self.d_gains * (self.target_velocity - vel)
         return np.clip(torque, -self.torque_limits, self.torque_limits)
+
+    def _evaluation_inputs(self, residual, limits):
+        if self._evaluation_history is None:
+            shape = (*self._targets.shape[:2], residual.shape[-1])
+            self._evaluation_history = (self._targets.copy(), self._target_velocities.copy(), np.zeros(shape))
+            self._last_eval_reference = np.full_like(self.q_ref, np.nan)
+            self._last_eval_offset = np.full_like(self.q_ref, np.nan)
+        reference = self.q_ref.copy()
+        reference[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
+        velocity = self.dq_ref.copy()
+        velocity[:, self.held_dof_indices] = 0
+        velocity[((reference <= limits[:, 0]) & (velocity < 0))
+                 | ((reference >= limits[:, 1]) & (velocity > 0))] = 0
+        inputs = (np.clip(reference, limits[:, 0], limits[:, 1]), velocity, residual)
+        for history, value in zip(self._evaluation_history, inputs):
+            history[1:] = history[:-1].copy()
+            history[0] = value
+        rows = np.arange(self.num_envs)
+        return tuple(history[self._latency, rows] for history in self._evaluation_history)
+
+    def _apply_evaluation_impulse(self):
+        impulse = np.asarray(self.evaluation_impulse, dtype=float)
+        if impulse.shape != (self.num_envs,) or not np.isfinite(impulse).all():
+            raise ValueError("Expected one finite signed lateral impulse (N s) per environment")
+        self.evaluation_impulse = None
+        w, x, y, z = self.sim.qpos[:, 3:7].T
+        yaw = np.arctan2(2 * (w*z + x*y), 1 - 2 * (y*y + z*z))
+        force = self.sim.batch.bind("xfrc_applied")[:, self.sim.model.body(self.cfg.asset.root_body).id, :2]
+        original = force.copy()
+        force += np.column_stack((-np.sin(yaw), np.cos(yaw))) * (impulse / self.cfg.sim.dt)[:, None]
+        return force, original
 
     def step(self, actions):
         if self._closed:
@@ -186,6 +242,18 @@ class SprintEnv(SprintRobot):
         # Joint constraints apply to the combined reference+residual, not either separately.
         limits = self.sim.model.jnt_range[self.sim.joint_ids]
         self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
+        if self.record_evaluation:
+            eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
+            shape = (self.cfg.control.decimation, *self.torques.shape)
+            trace = {
+                "requested_torque": np.empty(shape),
+                "applied_torque": np.empty(shape),
+                "joint_velocity": np.empty(shape),
+                "residual": np.repeat(eval_residual[None], shape[0], axis=0),
+                "action": self.actions.copy(),
+                "action_clipped": clipped.copy(),
+                "anti_windup": np.zeros((shape[0], *eval_residual.shape), dtype=bool),
+            }
         self._targets[1:] = self._targets[:-1].copy()
         self._targets[0] = np.clip(target, limits[:, 0], limits[:, 1])
         velocity = self.dq_ref.copy()
@@ -204,16 +272,40 @@ class SprintEnv(SprintRobot):
         for substep in range(self.cfg.control.decimation):
             self._lookahead_s = (substep + 1) * self.cfg.sim.dt
             self.torques[:] = self._compute_torques(self.actions)
-            if self.record_failure_trace:
+            if self.record_evaluation or self.record_failure_trace:
+                joint_velocity = self.sim.qvel[:, self.sim.qvel_ids]
                 p_torque = self.p_gains * (self._pd_target - self.sim.qpos[:, self.sim.qpos_ids])
-                d_torque = self.d_gains * (self.target_velocity - self.sim.qvel[:, self.sim.qvel_ids])
+                d_torque = self.d_gains * (self.target_velocity - joint_velocity)
                 requested_torque = p_torque + d_torque
+            if self.record_evaluation:
+                trace["requested_torque"][substep] = requested_torque
+                trace["applied_torque"][substep] = self.torques
+                trace["joint_velocity"][substep] = joint_velocity
+                neutral = eval_ref
+                if getattr(self.cfg.control, "reference_lookahead", False):
+                    neutral = np.clip(eval_ref + eval_velocity * self._lookahead_s, limits[:, 0], limits[:, 1])
+                offset = self._pd_target - neutral
+                if substep == 0:
+                    trace["p_jump_reference"] = self.p_gains * (neutral - self._last_eval_reference)
+                    trace["p_jump_residual"] = self.p_gains * (offset - self._last_eval_offset)
+                if substep == self.cfg.control.decimation - 1:
+                    self._last_eval_reference[:] = neutral
+                    self._last_eval_offset[:] = offset
+            if self.record_failure_trace:
                 step_saturation += (np.abs(self.torques) >= 0.99 * self.torque_limits) / self.cfg.control.decimation
                 np.maximum(step_torque_peak, np.abs(self.torques), out=step_torque_peak)
             self._torque_saturation_sums += (
                 np.abs(self.torques) >= 0.99 * self.torque_limits
             ) / self.cfg.control.decimation
-            self.sim.step(self.torques, observe=substep == self.cfg.control.decimation - 1)
+            observe = substep == self.cfg.control.decimation - 1
+            if substep == 0 and self.evaluation_impulse is not None:
+                force, original = self._apply_evaluation_impulse()
+                try:
+                    self.sim.step(self.torques, observe=observe)
+                finally:
+                    force[:] = original
+            else:
+                self.sim.step(self.torques, observe=observe)
             self._update_contacts()
         self.common_step_counter += 1
         self.episode_length_buf += 1
@@ -223,6 +315,9 @@ class SprintEnv(SprintRobot):
         self.q_ref_aligned = self.reference.evaluate(self.filtered_speed, time_offset=self.dt)[0]
         # Evaluate the reference and command that actually produced this transition.
         self.compute_reward()
+        if self.record_evaluation:
+            trace["prior_reward"] = self._reward_prior()
+            trace["joint_velocity_end"] = self.dof_vel.copy()
         self._record_tracking_diagnostics()
         self._record_command_scores()
         self.last_actions[:] = self.actions
@@ -250,6 +345,7 @@ class SprintEnv(SprintRobot):
             w, x, y, z = self.base_quat.T
             yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
             extras["evaluation"] = {
+                **trace,
                 "joint_pos": self.dof_pos[:, self.reference.indices].copy(),
                 "reference_joint_pos": self.q_ref[:, self.reference.indices].copy(),
                 "forward_velocity": (np.cos(yaw) * self.sim.qvel[:, 0] + np.sin(yaw) * self.sim.qvel[:, 1]).copy(),

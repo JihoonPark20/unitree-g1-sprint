@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from legged_gym.scripts.control_metrics import PITCH_JOINTS, ControlMetrics, speed_summary, summarize_bins
 from legged_gym.utils.failure_trace import FailureTrace
 
 from spectral_prior import JOINT_NAMES
@@ -44,6 +46,8 @@ def evaluate_policy(env, runner, args):
     env.cfg.commands.resampling_time = (total + 1) * env.dt
     env.cfg.commands.curriculum = False
     env.cfg.commands.standing_fraction = 0
+    env.evaluation_latency_steps = getattr(args, "latency_steps", None)
+    impulse = getattr(args, "push_impulse", 0.)
     env.record_evaluation = True
     env.record_failure_trace = failure_window > 0
     policy = runner.get_inference_policy(device=runner.device)
@@ -72,14 +76,24 @@ def evaluate_policy(env, runner, args):
                     reached = np.zeros(env.num_envs, dtype=bool)
                     failure_times = [None] * env.num_envs
                     failure_trace = FailureTrace(env.num_envs, env.dt, failure_window) if failure_window else None
+                    metrics = ControlMetrics(env)
+                    pushed = np.zeros(env.num_envs, dtype=bool)
+                    physical_rows = {key: [] for key in ("applied_torque", "requested_torque", "joint_velocity")}
+                    jump_rows = {key: [] for key in ("p_jump_reference", "p_jump_residual")}
+                    jump_masks = []
                     q_rows, ref_rows, trace_rows = [], [], []
                     for step in range(total):
+                        if step == warmup and impulse:
+                            pushed[:] = active
+                            direction = np.where((np.arange(env.num_envs) + seed) % 2, -1., 1.)
+                            env.evaluation_impulse = impulse * direction * pushed
                         obs, _, dones, extras = env.step(policy(obs.to(runner.device)))
                         sample = extras["evaluation"]  # t+dt, before automatic reset
                         done = dones.cpu().numpy().astype(bool)
                         if failure_trace is not None:
                             failure_trace.record(sample["failure_trace"], active, done)
                         if step >= warmup:
+                            metrics.add(sample, active)
                             ids = np.flatnonzero(active)
                             q = sample["joint_pos"][ids]
                             reference = sample["reference_joint_pos"][ids]
@@ -92,6 +106,11 @@ def evaluate_policy(env, runner, args):
                             q_rows.append(q.astype(np.float32))
                             ref_rows.append(reference.astype(np.float32))
                             if args.save_trajectories:
+                                for key, rows in physical_rows.items():
+                                    rows.append(sample[key][:, ids].swapaxes(0, 1))
+                                for key, rows in jump_rows.items():
+                                    rows.append(sample[key][ids].copy())
+                                jump_masks.append(np.isfinite(sample["p_jump_reference"][ids]).all(1))
                                 trace_rows.append(
                                     np.column_stack((ids, np.full(len(ids), (step + 1) * env.dt), velocity))
                                 )
@@ -115,12 +134,15 @@ def evaluate_policy(env, runner, args):
                                                     "d_gains": env.d_gains[env.action_dof_indices],
                                                     "torque_limits_Nm": env.torque_limits[env.action_dof_indices],
                                                     "physics_dt_s": env.cfg.sim.dt, "control_dt_s": env.dt})
+                    control_stats = metrics.finish()
                     for i in range(env.num_envs):
                         n = int(counts[i])
                         trials.append(
                             {
                                 "seed": seed,
                                 "env_index": i,
+                                "controller": control_stats[i],
+                                "pushed": bool(pushed[i]),
                                 "samples": n,
                                 "complete": bool(active[i] and n == steps),
                                 "failure_time_s": failure_times[i],
@@ -142,6 +164,13 @@ def evaluate_policy(env, runner, args):
                             forward_velocity=trace[:, 2],
                             command_speed=speed,
                             joint_names=np.array(JOINT_NAMES),
+                            control_joint_names=np.array(env.dof_names),
+                            p_jump_valid=np.concatenate(jump_masks) if jump_masks else np.empty(0, dtype=bool),
+                            **{key: np.concatenate(rows) if rows else np.empty((0, len(env.dof_names)))
+                               for key, rows in jump_rows.items()},
+                            **{key: np.concatenate(rows) if rows else
+                               np.empty((0, env.cfg.control.decimation, len(env.dof_names)))
+                               for key, rows in physical_rows.items()},
                         )
                 q, reference = np.concatenate(speed_q), np.concatenate(speed_ref)
                 pooled_q.append(q)
@@ -158,6 +187,7 @@ def evaluate_policy(env, runner, args):
                 for name in ("E_qpos_observed", "E_vel_observed", "mean_forward_speed"):
                     values = [t[name] for t in trials if t[name] is not None]
                     row[name] = float(np.mean(values)) if values else None
+                row["controller_summary"] = speed_summary([row])
                 results.append(row)
                 print(
                     f"v={speed:.1f}: survival={row['survival_fraction']:.3f}, samples={len(q)}, complete={row['complete']}",
@@ -166,6 +196,7 @@ def evaluate_policy(env, runner, args):
     finally:
         env.record_evaluation = False
         env.record_failure_trace = False
+        env.evaluation_latency_steps = None
     aggregate = aggregate_results(results)
     q, reference = np.concatenate(pooled_q), np.concatenate(pooled_ref)
     fid = frechet_distance(reference, q) if len(q) >= 2 else None
@@ -174,12 +205,13 @@ def evaluate_policy(env, runner, args):
     grid_matches = sorted(args.speeds) == PAPER_SPEED_GRID
     ramp_complete = warmup * env.dt >= max(args.speeds) / env.cfg.commands.acceleration_limit
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "paper": "https://arxiv.org/abs/2605.28549v1",
         "checkpoint": str(Path(args.checkpoint_path).resolve()),
         "checkpoint_sha256": sha256(args.checkpoint_path),
         "prior_sha256": sha256(env.cfg.reference.checkpoint),
         "control_contract": runner.sprint_contract(),
+        "speed_bins": summarize_bins(results),
         "versions": {name: version(name) for name in ("mujoco", "rsl-rl-lib", "torch", "numpy")},
         "protocol": {
             "speed_grid_matches_paper": grid_matches,
@@ -187,6 +219,8 @@ def evaluate_policy(env, runner, args):
             "command_ramp_complete_before_measurement": ramp_complete,
             "default_protocol_settings": (
                 grid_matches
+                and impulse == 0
+                and getattr(args, "latency_steps", None) in (None, 0)
                 and args.seeds == [42, 43, 44]
                 and env.num_envs == 8
                 and steps * env.dt == 20
@@ -202,7 +236,18 @@ def evaluate_policy(env, runner, args):
             "measurement_seconds": steps * env.dt,
             "initial_state": "environment reset distribution; fixed seed stream per command; LSTM and phase reset",
             "commands": "constant target [vx,0,0]; existing acceleration ramp from rest",
-            "randomization": "noise/push/mass/friction off; configured reset state and motor latency retained",
+            "randomization": "noise, spontaneous pushes, friction and mass variation disabled",
+            "latency_steps": getattr(args, "latency_steps", None),
+            "latency_steps_training": getattr(env.cfg.control, "fixed_latency_steps", None),
+            "latency_max_training": env.cfg.control.max_latency_steps,
+            "push_impulse_Ns": impulse,
+            "push_protocol": "heading-frame lateral pelvis COM impulse on first measured tick, opposite signs by environment parity and seed",
+            "spectral_joints": PITCH_JOINTS,
+            "control_joint_names": env.dof_names,
+            "welch": "200 Hz applied torque, one-second Hann windows, half overlap, detrended. Per-joint summed 20-100 Hz / all bins, then equal joint mean.",
+            "smoothness": "Policy-rate clipped residual actions and pre-reset endpoint joint velocities. Joint mean squared first/second action difference and absolute second velocity difference / dt^2, pooled by valid count.",
+            "p_jump": "RMS Nm at the first substep relative to the previous last substep. Reference is the delayed zero-residual target; residual is the remaining applied target offset after clipping.",
+            "speed_bins": "command bins [0,2), [2,4), [4,6]. Tracking errors equally weight trials then observed commands; controller sums pool valid samples.",
             "sampling": "post-step state and same-time spectral reference; includes first failure; excludes all later resets",
             "aggregation": "time mean per trial, equal trial mean per speed, equal speed mean; full metrics require every trial complete",
             "failure_handling": "no replacement trials or success filtering; observed-only diagnostics separated; missing full metrics are null",
@@ -227,9 +272,18 @@ def main(argv=None):
     from legged_gym.utils.helpers import get_args
 
     args = get_args(argv, mode="evaluate")
+    if args.calibrate_push:
+        args.speeds = [3.0]
+        if args.warmup_seconds is None:
+            args.warmup_seconds = 8.0
     env, runner = make_playback(args, evaluation=True)
     try:
-        evaluate_policy(env, runner, args)
+        if args.calibrate_push:
+            from legged_gym.scripts.push_calibration import calibrate_push
+
+            calibrate_push(env, runner, args, evaluate_policy)
+        else:
+            evaluate_policy(env, runner, args)
     finally:
         env.close()
 
