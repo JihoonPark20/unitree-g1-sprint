@@ -300,7 +300,7 @@ class TaskRegistry:
             )
         from legged_gym.runners.on_policy_runner import SprintRunner, sprint_runner_config
 
-        runner = SprintRunner(env, sprint_runner_config(train_cfg), log_dir, device=device)
+        runner = SprintRunner(env, sprint_runner_config(train_cfg, env), log_dir, device=device)
         if getattr(args, "warm_start", None):
             runner.warm_start(args.warm_start)
         if getattr(args, "resume", False) or getattr(args, "checkpoint_path", None):

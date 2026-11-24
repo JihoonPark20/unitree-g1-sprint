@@ -38,6 +38,7 @@ class SprintCfg(G1FlatCfg):
         residual_feedforward = 0.0
         residual_obs = False
         residual_mix_direct = 0.0
+        increment_kappa = None
         target_interp = None  # Inherit the checkpoint's reference_lookahead rule.
         # MJCF actuator ctrlrange; the inherited 25 Nm default under-limited ankles and waist roll/pitch.
         effort_limits = {**G1FlatCfg.control.effort_limits, ".*_ankle_.*": 50.0, "waist_(roll|pitch)_joint": 50.0}
@@ -145,6 +146,7 @@ class SprintPPOCfg(G1FlatCfgPPO):
 
     class policy(G1FlatCfgPPO.policy):
         recurrent = True
+        integrate_mean = False
         actor_hidden_dims = []
         critic_hidden_dims = [256, 128]  # SPRINT specifies the actor only.
         obs_normalization = True

@@ -130,3 +130,21 @@ the difference between successive delayed commands over the 20 ms policy
 period. `residual_mix_direct` sets the fraction of a lowpass target applied
 directly alongside the filtered state. Its direct jump is excluded from
 the velocity target.
+
+### Integrated action increments
+
+For C1-env, set `control.residual_mode="integrator"`, `control.residual_leak=0`
+and `control.increment_kappa` to the desired fraction of each joint's residual
+limit per policy interval. At 50 Hz the simulator clips the scaled Gaussian
+sample to that increment, divides by 20 ms to obtain rad/s, and integrates it
+at 200 Hz. Its action observation contains the bounded requested increment in
+policy action units. Torque and joint limits can reduce the realized increment.
+
+For C1-mean, set `train.policy.integrate_mean=True`, `control.residual_mode="position"`
+and `control.increment_kappa`. The actor adds its bounded increment to the
+previous clean mean, caps the result at the joint's residual limit, and samples
+an absolute action from the usual Gaussian. Exploration standard deviation uses
+the same action units as A0. Each PPO transition stores the clean previous mean
+alongside its observations. The actor clears that history on episode reset.
+Deterministic playback applies the clean mean directly. Both C1 arms use the
+experiment grid `increment_kappa` ∈ {0.1, 0.2, 0.4}.

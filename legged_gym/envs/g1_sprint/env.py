@@ -75,6 +75,15 @@ class SprintEnv(SprintRobot):
             raise ValueError("Lowpass residual dynamics require a positive leak")
         if mix and mode != "lowpass":
             raise ValueError("Direct position mixing requires a lowpass target in radians")
+        kappa = cfg.control.increment_kappa
+        self._increment_action_limits = None
+        if kappa is not None:
+            if not np.isfinite(kappa) or kappa <= 0 or self.residual_limits is None:
+                raise ValueError("increment_kappa requires a positive finite fraction and per-joint residual limits")
+            if mode == "integrator" and leak == 0:
+                self._increment_action_limits = kappa * self.residual_limits / cfg.control.action_scale
+            elif mode != "position":
+                raise ValueError("Bounded increments require pure integration or an integrated-mean position policy")
         self._uses_residual_state = mode != "position" or ff != 0 or cfg.control.residual_obs
         self.residual_dynamics = None
         if self._uses_residual_state:
@@ -321,9 +330,13 @@ class SprintEnv(SprintRobot):
         if self.residual_limits is not None and self.cfg.control.residual_mode != "integrator":
             action_limits = self.residual_limits / self.cfg.control.action_scale
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
+        if self._increment_action_limits is not None:
+            self.actions[:] = np.clip(self.actions, -self._increment_action_limits, self._increment_action_limits)
         # Previous-action observations describe the bounded residual actually
         # requested from PD, while PPO retains its original sampled actions.
         residual = self.cfg.control.action_scale * self.actions
+        if self._increment_action_limits is not None:
+            residual = residual / self.dt
         clipped = np.abs(actions - self.actions) > 1e-7
         bound = self.cfg.control.action_scale * self.cfg.control.clip_actions
         if self.residual_limits is not None:

@@ -48,3 +48,15 @@ class SprintPPO(PPO):
             # rsl-rl adds gamma*V(o_t) below; replace that with V(terminal).
             rewards = rewards + self.gamma * (values - self.transition.values.squeeze(-1)) * mask
         super().process_env_step(obs, rewards, dones, extras)
+
+
+class IntegratedMeanPPO(SprintPPO):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.storage.observations.set(self.actor.replay_key, torch.empty_like(self.storage.actions))
+
+    def act(self, obs):
+        actions = super().act(obs)
+        # The environment owns its observation TensorDict. Only storage sees the clean history.
+        self.transition.observations = obs.clone(False).set(self.actor.replay_key, self.actor.rollout_previous_mean)
+        return actions

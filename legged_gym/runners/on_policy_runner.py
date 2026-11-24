@@ -12,10 +12,11 @@ from spectral_prior import JOINT_NAMES
 from spectral_prior.data import sha256
 
 
-def sprint_runner_config(train):
+def sprint_runner_config(train, env=None):
     config = runner_config(train)
     config["algorithm"]["class_name"] = "legged_gym.algorithms.ppo:SprintPPO"
-    if getattr(train.policy, "recurrent", True):
+    recurrent = getattr(train.policy, "recurrent", True)
+    if recurrent:
         for key in ("actor", "critic"):
             config[key].update(
                 class_name="legged_gym.modules.actor_critic:SprintRecurrentModel",
@@ -24,6 +25,20 @@ def sprint_runner_config(train):
                 rnn_type="lstm",
                 rnn_num_layers=1,
             )
+    if getattr(train.policy, "integrate_mean", False):
+        if env is None or env.cfg.control.residual_mode != "position" or env.cfg.control.increment_kappa is None:
+            raise ValueError("An integrated-mean actor requires position control and an increment_kappa")
+        if env.num_actions != len(env.action_dof_names):
+            raise ValueError("An integrated-mean actor requires one output per action joint")
+        model = "IntegratedMeanLSTM" if recurrent else "IntegratedMeanMLP"
+        config["actor"].update(
+            class_name=f"legged_gym.modules.actor_critic:{model}",
+            action_limits=(env.residual_limits / env.cfg.control.action_scale).tolist(),
+            increment_kappa=env.cfg.control.increment_kappa,
+        )
+        config["algorithm"]["class_name"] = "legged_gym.algorithms.ppo:IntegratedMeanPPO"
+    elif env is not None and env.cfg.control.increment_kappa is not None and env.cfg.control.residual_mode == "position":
+        raise ValueError("Position control with increment_kappa requires policy.integrate_mean")
     return config
 
 
@@ -59,6 +74,9 @@ class SprintRunner(LeggedOnPolicyRunner):
             "observation": "angular_gravity_filtered_commands_q_dq_previous_residual",
             "critic_extra": "base_linear_velocity_reference_10",
         }
+        if self.env.cfg.control.increment_kappa is not None:
+            contract["increment_kappa"] = self.env.cfg.control.increment_kappa
+            contract["increment_mode"] = self.env.cfg.control.residual_mode
         return contract
 
     def save(self, path, infos=None):
