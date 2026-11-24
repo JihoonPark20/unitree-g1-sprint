@@ -93,3 +93,6 @@ For each task, `compare` reports the environment steps (millions) and wall-clock
 - curriculum maximum command ≥ 4 m/s
 
 Each milestone uses a 10-iteration rolling mean. `compare` also reports final tracking, gait and posture metrics. `Tracking/prior_mae_rad` always uses the same-instant reference, so all tasks are comparable.
+
+Run `sprint-reference --headless` for one second of reference playback. Use
+`--source prior --mode pd` to exercise torque-limited suspended PD tracking.

@@ -266,6 +266,7 @@ def main(argv=None):
     parser.add_argument("--mode", choices=["kinematic", "pd"], default="kinematic")
     parser.add_argument("--gravity-comp", action="store_true", help="Viewer-only gravity torque compensation in PD mode")
     parser.add_argument("--height", type=float, default=1.5, help="Fixed pelvis height in meters")
+    parser.add_argument("--headless", action="store_true", help="Run one second of playback and exit")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
@@ -278,6 +279,16 @@ def main(argv=None):
     playback = ReferencePlayback(args.library, args.prior, motion=args.motion, height=args.height)
     if not 1 <= args.clip <= len(playback.clips):
         parser.error(f"--clip must be between 1 and {len(playback.clips)}")
+    if args.headless:
+        clip = list(playback.clips)[args.clip - 1]
+        steps = round(1 / playback.model.opt.timestep)
+        playback.reset(playback.target(args.source, clip, args.speed, True))
+        q = playback.advance(args.source, clip, args.speed, True, args.mode, 1, steps,
+                             gravity_comp=args.gravity_comp)
+        if not np.isfinite(q).all():
+            raise FloatingPointError("Nonfinite reference trajectory")
+        print(f"{args.source} / {args.mode}: {steps} steps, {playback.time:.3f} s, {len(q)} joints")
+        return
     viewer = ReferenceViewer(playback, args)
     print(f"Reference viewer: {viewer.url}", flush=True)
     print("Pelvis fixed in midair. No policy checkpoint required. Stop with Ctrl+C.", flush=True)
