@@ -1,5 +1,6 @@
 """Paper speed-grid evaluation with explicit trial coverage and aligned samples."""
 
+import json
 from importlib.metadata import version
 from pathlib import Path
 
@@ -204,10 +205,23 @@ def evaluate_policy(env, runner, args):
     aggregate["FID_joint_observed_only"] = fid
     grid_matches = sorted(args.speeds) == PAPER_SPEED_GRID
     ramp_complete = warmup * env.dt >= max(args.speeds) / env.cfg.commands.acceleration_limit
+    checkpoint = Path(args.checkpoint_path).resolve()
+    snapshot = checkpoint.parent / "run_config.json"
+    training = json.loads(snapshot.read_text())
+    control = training["env"]["control"]
     report = {
         "schema_version": 3,
         "paper": "https://arxiv.org/abs/2605.28549v1",
-        "checkpoint": str(Path(args.checkpoint_path).resolve()),
+        "checkpoint": str(checkpoint),
+        "training": {
+            "arm": control.get("arm", "A0"),
+            "arm_options": control.get("arm_options", {}),
+            "seed": training["train"]["seed"],
+            "iterations": runner.current_learning_iteration + 1,
+            "config": str(snapshot),
+            "config_sha256": sha256(snapshot),
+            "experiment_name": training["train"]["runner"]["experiment_name"],
+        },
         "checkpoint_sha256": sha256(args.checkpoint_path),
         "prior_sha256": sha256(env.cfg.reference.checkpoint),
         "control_contract": runner.sprint_contract(),

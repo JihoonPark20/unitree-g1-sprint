@@ -82,6 +82,20 @@ class SprintRunner(LeggedOnPolicyRunner):
             "observation": "angular_gravity_filtered_commands_q_dq_previous_residual",
             "critic_extra": "base_linear_velocity_reference_10",
         }
+        control = self.env.cfg.control
+        if control.arm != "A0":
+            contract["arm"] = control.arm
+        if control.arm == "A1-R":
+            contract["action_rate_weight"] = -self.env.cfg.rewards.scales["action_rate"]
+        active = (control.target_interp is not None or control.residual_mode != "position"
+                  or control.residual_obs or control.residual_feedforward or control.fixed_latency_steps is not None)
+        if active:
+            contract["residual_controller"] = {
+                "target_interp": control.target_interp, "mode": control.residual_mode,
+                "leak": control.residual_leak, "feedforward": control.residual_feedforward,
+                "observe_state": control.residual_obs, "mix_direct": control.residual_mix_direct,
+                "fixed_latency_steps": control.fixed_latency_steps,
+            }
         if self.env.auxiliary_actions:
             contract["auxiliary_actions"] = self.env.auxiliary_actions
         if self.env.cfg.reference.phase_modulation:
@@ -109,6 +123,8 @@ class SprintRunner(LeggedOnPolicyRunner):
         The new reward / curriculum may differ. Value function, optimizer,
         iteration counter and exploration parameters remain freshly initialized.
         """
+        if self.env.cfg.control.arm != "A0":
+            raise ValueError("Changed controller arms require fresh training and reject --warm_start")
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         metadata = checkpoint.get("infos") or {}
         if metadata.get("sprint") != self.sprint_contract() or metadata.get("legged_gym", {}).get("contract") != policy_contract(self.env):

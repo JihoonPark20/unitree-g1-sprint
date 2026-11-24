@@ -164,3 +164,38 @@ commands undergo the same input delay. Set the initial `residual_leak` above
 `lambda_min` (default 0). The decoder initializes the leak channel to that
 rate for every observation. Joint observations, bounds and controller metrics
 continue to use 23 physical joints.
+
+### Train a residual controller arm
+
+Run `sprint-train --headless --arm A0 --seed 0` for the stock controller.
+Each named arm writes under `logs/g1_sprint_<arm>/`. The timestamped run
+directory contains the resolved environment and PPO settings in `run_config.json`.
+Use a fresh training run for a changed arm. Playback and evaluation read the
+controller, observation layout and actor architecture beside the checkpoint.
+
+| Arm | Controller changes | Grid option |
+| --- | --- | --- |
+| A0 | Stock substep reference lookahead and direct residual position | |
+| A1 | Evaluate exact reference position and velocity at each substep | |
+| A1-R | A1 with a penalty on the joint-mean squared difference between consecutive bounded actions in one episode | `--action-rate-weight W` (positive, default 0.0001) |
+| F | A1 with a lowpass residual, λ = 2π times cutoff in Hz | `--cutoff-hz {5,10,20}` (default 10) |
+| B-obs, B-ff, B | F with residual state observation, unit residual velocity feedforward, or both | Same cutoff as F |
+| Hyb | Selected B-family controller plus a direct position fraction | `--base-arm`, `--beta {0.2,0.4}` (default 0.2) |
+| D-ctrl, D | Add phase observation to the selected parent. D enables 10% phase-rate modulation. | `--base-arm` and the parent's grid options |
+| C1-env, C1-mean | Integrate bounded sampled increments in physics or integrate the clean Gaussian mean in the actor | `--base-arm`, `--kappa {0.1,0.2,0.4}` (default 0.2) |
+| C2 | Learn one leak rate around the parent controller's initial bandwidth | `--base-arm` and its cutoff |
+
+Hyb and C variants accept B-obs, B-ff or B as a parent (default B).
+D-ctrl and D also accept A0, A1, F and Hyb. For a Hyb parent, pass its B-family
+choice through `--hyb-base-arm`. For example, these two commands use the same
+parent and train at one tick of input delay.
+
+```bash
+sprint-train --headless --arm D-ctrl --base-arm Hyb --hyb-base-arm B-ff --cutoff-hz 5 --beta 0.4 --latency-steps 1
+sprint-train --headless --arm D      --base-arm Hyb --hyb-base-arm B-ff --cutoff-hz 5 --beta 0.4 --latency-steps 1
+```
+
+Use `--residual-scale VALUE` to set the physical action scale for an RMS-matched
+retraining. `--latency-steps {0,1,2}` sets a fixed training delay in policy
+ticks. Preserve the checkpoint's adjacent configuration and prior for playback.
+Older checkpoints retain their recorded control settings and receive the A0 arm label.

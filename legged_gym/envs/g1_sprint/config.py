@@ -21,6 +21,9 @@ class SprintCfg(G1FlatCfg):
         speed_calibration = "g1_kinematic"
 
     class control(G1FlatCfg.control):
+        arm = "A0"
+        arm_options = {}
+        fixed_latency_steps = None
         decimation = 4  # 200 Hz physics, 50 Hz policy
         stiffness = {
             **G1FlatCfg.control.stiffness, ".*_hip_pitch_joint": 200.0,

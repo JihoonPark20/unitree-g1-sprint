@@ -73,3 +73,22 @@ sprint-evaluate --checkpoint_path "<model>.pt" --speeds 3 --warmup-seconds 8 \
 Signed per-joint `p_jump_reference` and `p_jump_residual` arrays use axes [measured policy sample, joint]. `p_jump_valid` excludes the undefined boundary after reset.
 
 The impulse in the last command is an example magnitude in N·s. Each exposed pelvis receives one heading-frame lateral impulse at its center of mass over the first physics substep after warmup. Signs alternate by environment and evaluation seed. Calibration holds the 3 m/s command, checkpoint, initial conditions and evaluation horizon fixed. It tests zero, doubles the impulse through 256 N·s until unconditional survival crosses 50%, then refines the interval. The output records every probe. A calibrated magnitude requires observed survival within one trial of half the cohort. Calibration records a null result if zero-impulse survival is already at or below 50%, the target is unbracketed or the tested impulses miss the tolerance.
+
+### Aggregate independent training seeds
+
+Run `python -m legged_gym.scripts.aggregate --root ~/sprint-ode-runs` after
+saving the evaluation JSONs. The command reads `manifest.json` and the frozen
+variant selections and G0 band in `decisions.json`. Without a manifest it
+discovers evaluation JSONs recursively and reads their checkpoint snapshots.
+Keep the checkpoint and adjacent `run_config.json` available during aggregation.
+
+`results.csv` and `results.md` group measurements by controller variant, speed
+band, train/test latency, and impulse. Each CSV metric has its own count of
+training seeds, mean and sample standard deviation. `seed_metrics.json` retains
+the per-seed measurements, six spectral joint ratios and per-joint P jumps.
+`verdicts.json` gives hypothesis criteria, input paths, G0/G2 decisions and
+physical action-scale corrections for confounded comparisons. Formal verdicts
+require the registered trial protocol, training seeds, matching prior and PPO
+settings, and selected conditions. Retention requires every matched seed to
+be no worse. Mixed observations without a decisive adverse difference leave
+retention inconclusive.

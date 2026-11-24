@@ -58,7 +58,7 @@ def policy_contract(env):
         contract["residual_limits_rad"] = env.residual_limits.tolist()
     if getattr(env.cfg.control, "reference_velocity", False):
         contract["reference_velocity"] = "phase_central_difference"
-    if getattr(env.cfg.control, "reference_lookahead", False):
+    if getattr(env.cfg.control, "target_interp", None) is None and getattr(env.cfg.control, "reference_lookahead", False):
         contract["reference_lookahead"] = "velocity_interpolated_substeps"
     calibration = getattr(env.reference, "speed_calibration", None) if hasattr(env, "reference") else None
     if calibration is not None:
@@ -169,9 +169,12 @@ class TaskRegistry:
         self.get_task_class(name)
         env_cfg = deepcopy(self.env_cfgs[name])
         train_cfg = deepcopy(self.train_cfgs[name])
-        if args is not None and (getattr(args, "resume", False) or getattr(args, "checkpoint_path", None)):
+        restoring = args is not None and bool(getattr(args, "resume", False) or getattr(args, "checkpoint_path", None))
+        if restoring:
             if not getattr(args, "checkpoint_path", None):
                 experiment = getattr(args, "experiment_name", None) or train_cfg.runner.experiment_name
+                if getattr(args, "arm", None):
+                    experiment = f"{name}_{args.arm}"
                 root = LOG_DIR / experiment
                 args.checkpoint_path = get_load_path(root, args.load_run, args.checkpoint)
             snapshot_path = Path(args.checkpoint_path).resolve().parent / "run_config.json"
@@ -223,10 +226,18 @@ class TaskRegistry:
                 if legacy_rewards:
                     # Old policies used one shared width for both tracking terms.
                     env_cfg.rewards.tracking_ang_sigma = env_cfg.rewards.tracking_sigma
-                train_cfg.runner.experiment_name = name
+                arm_experiment = f"{name}_{env_cfg.control.arm}"
+                if train_cfg.runner.experiment_name != arm_experiment:
+                    train_cfg.runner.experiment_name = name
             else:
                 raise ValueError("Checkpoint requires adjacent run_config.json")
         if args is not None:
+            from legged_gym.envs.g1_sprint.arms import select_arm
+
+            select_arm(env_cfg, train_cfg, args, restoring=restoring)
+            if (restoring and not getattr(args, "play", False) and getattr(args, "latency_steps", None) is not None
+                    and args.latency_steps != env_cfg.control.fixed_latency_steps):
+                raise ValueError("Cannot change training latency when resuming a checkpoint")
             update_cfg_from_args(env_cfg, train_cfg, args)
         env_cfg.seed = train_cfg.seed
         prior = env_cfg.reference.checkpoint

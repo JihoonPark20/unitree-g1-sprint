@@ -715,6 +715,10 @@ class SprintEnv(SprintRobot):
     def _reward_tracking_lin_vel(self):
         return np.exp(-np.square(self.filtered_speed - self._forward_velocity()) / self.cfg.rewards.tracking_sigma)
 
+    def _reward_action_rate(self):
+        valid = self.episode_length_buf.numpy() > 1
+        return np.square(self.actions - self.last_actions).mean(axis=1) * valid
+
     def _reward_prior(self):
         ids = self.reference.indices
         aligned = getattr(self.cfg.reference, "prior_reward_time_aligned", False)

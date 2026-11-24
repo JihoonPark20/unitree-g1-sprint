@@ -114,6 +114,9 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--latency-steps", type=int, choices=(0, 1, 2),
                             help="Use exactly this many policy ticks of controller input delay")
     if mode == "train":
+        from legged_gym.envs.g1_sprint.arms import add_arm_arguments
+
+        add_arm_arguments(parser)
         parser.add_argument("--max_iterations", "--max-iterations", type=int)
         parser.add_argument("--max_grad_norm", type=float)
         parser.add_argument("--desired_kl", type=float)
