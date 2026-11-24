@@ -42,10 +42,11 @@ class SprintRobot(VecEnv):
         self.action_dof_names = list(cfg.asset.action_joint_names)
         if not self.num_dof or len(set(self.dof_names)) != self.num_dof:
             raise ValueError("asset.joint_names must contain unique physical joint names")
+        num_joint_actions = self.num_actions - len(getattr(self, "auxiliary_actions", ()))
         if (
-            self.num_actions <= 0
-            or len(self.action_dof_names) != self.num_actions
-            or len(set(self.action_dof_names)) != self.num_actions
+            num_joint_actions <= 0
+            or len(self.action_dof_names) != num_joint_actions
+            or len(set(self.action_dof_names)) != num_joint_actions
             or not set(self.action_dof_names).issubset(self.dof_names)
         ):
             raise ValueError("asset.action_joint_names must contain one unique physical joint per action")
@@ -66,7 +67,7 @@ class SprintRobot(VecEnv):
         self._root_contact_index = self.sim.model.body(cfg.asset.root_body).id - 1
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
         self.common_step_counter = 0
-        shape = (self.num_envs, self.num_actions)
+        shape = (self.num_envs, num_joint_actions)
         self.actions = np.zeros(shape)
         self.last_actions = np.zeros(shape)
         self.last_dof_vel = np.zeros((self.num_envs, self.num_dof))

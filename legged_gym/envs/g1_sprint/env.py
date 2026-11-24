@@ -16,6 +16,19 @@ from spectral_prior.reference import ReferenceGenerator
 
 class SprintEnv(SprintRobot):
     def __init__(self, cfg, **kwargs):
+        if cfg.reference.phase_modulation not in (0, 0.1):
+            raise ValueError("phase_modulation must be 0 or 0.1")
+        self.auxiliary_actions = []
+        if cfg.reference.phase_modulation:
+            self.auxiliary_actions.append("phase")
+        if cfg.control.learned_leak:
+            if (cfg.control.residual_mode == "position" or not np.isfinite(cfg.control.lambda_min)
+                    or not 0 <= cfg.control.lambda_min < cfg.control.residual_leak):
+                raise ValueError("Learned leak requires residual dynamics with 0 <= lambda_min < initial residual_leak")
+            self.auxiliary_actions.append("leak")
+        joint_count = len(cfg.asset.action_joint_names)
+        if self.auxiliary_actions and cfg.env.num_actions == joint_count:
+            cfg.env.num_actions = joint_count + len(self.auxiliary_actions)
         roll_scale = cfg.rewards.scales.get("torso_roll", 0.0)
         roll_deadzone = getattr(cfg.rewards, "torso_roll_deadzone", 0.1)
         if not np.isfinite([roll_scale, roll_deadzone]).all() or roll_scale > 0 or not 0 <= roll_deadzone < 1:
@@ -198,16 +211,20 @@ class SprintEnv(SprintRobot):
             if self._substep_history is None:
                 shape = (depth, self.num_envs, self.cfg.control.decimation, self.num_dof)
                 self._substep_history = (np.zeros(shape), np.zeros(shape), np.zeros((depth, *self.actions.shape)))
+                if self.cfg.control.learned_leak:
+                    self._substep_history += (np.full((depth, self.num_envs, 1), self.cfg.control.residual_leak),)
             elif len(self._substep_history[0]) < depth:
                 self._substep_history = tuple(
                     np.concatenate((h, np.repeat(h[-1:], depth - len(h), axis=0))) for h in self._substep_history
                 )
-            positions, velocities, inputs = self._substep_history
+            positions, velocities, inputs = self._substep_history[:3]
+            if self.cfg.control.learned_leak:
+                self._substep_history[3][:, ids] = self.cfg.control.residual_leak
             positions[:, ids] = self.q_ref[ids, None]
             velocities[:, ids] = 0
             inputs[:, ids] = 0
 
-    def _issue_substep_targets(self, control_input):
+    def _issue_substep_targets(self, control_input, leak=None):
         count = self.cfg.control.decimation
         dt = self.cfg.sim.dt
         if self._target_interp == "exact":
@@ -220,6 +237,8 @@ class SprintEnv(SprintRobot):
                 times = (dt * np.arange(1, count + 1))[None, :, None]
                 position = position + times * velocity
         packet = (position, velocity, control_input)
+        if leak is not None:
+            packet += (leak,)
         if self._substep_history is None:
             return packet
         rows = np.arange(self.num_envs)
@@ -324,8 +343,19 @@ class SprintEnv(SprintRobot):
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
         actions = np.asarray(actions)
-        if actions.shape != self.actions.shape or not np.isfinite(actions).all():
-            raise ValueError(f"Expected finite residual actions of shape {self.actions.shape}")
+        action_shape = (self.num_envs, self.num_actions)
+        if actions.shape != action_shape or not np.isfinite(actions).all():
+            raise ValueError(f"Expected finite policy actions of shape {action_shape}")
+        leak = None
+        if self.auxiliary_actions:
+            joint_count = len(self.action_dof_names)
+            if self.cfg.reference.phase_modulation:
+                scale = 1 + self.cfg.reference.phase_modulation * np.tanh(actions[:, joint_count])
+                self.reference.phase_rate_scale = torch.as_tensor(scale, dtype=torch.float32)
+                self._update_reference()
+            if self.cfg.control.learned_leak:
+                leak = self.cfg.control.lambda_min + np.logaddexp(0, actions[:, -1:].astype(float))
+            actions = actions[:, :joint_count]
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
         if self.residual_limits is not None and self.cfg.control.residual_mode != "integrator":
             action_limits = self.residual_limits / self.cfg.control.action_scale
@@ -355,7 +385,7 @@ class SprintEnv(SprintRobot):
             target[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
             self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
         else:
-            packet = self._issue_substep_targets(residual)
+            packet = self._issue_substep_targets(residual, leak)
         if packet is None and (self.record_evaluation or self.residual_dynamics is not None):
             eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
             if self.residual_dynamics is not None:
@@ -393,7 +423,8 @@ class SprintEnv(SprintRobot):
                 offset = packet[2]
                 dynamics = self.residual_dynamics
                 if dynamics is not None:
-                    dynamics.advance(packet[2], reference, velocity, self.sim, first=substep == 0)
+                    applied_leak = packet[3] if self.cfg.control.learned_leak else None
+                    dynamics.advance(packet[2], reference, velocity, self.sim, first=substep == 0, leak=applied_leak)
                     offset = dynamics.applied
                     count = self.cfg.control.decimation
                     self._record_applied_residual(offset, count)
@@ -620,7 +651,8 @@ class SprintEnv(SprintRobot):
             self._cycle_error_sums[~settled] = 0  # A scored cycle must be settled throughout.
             self._cycle_steps[~settled] = 0
             # The phase wraps on this step's advance: credit the cycle-mean kernel to each of its steps.
-            wraps = self.reference.phase.numpy() + self.reference.frequency(self.filtered_speed).numpy() * self.dt >= 1
+            cadence = self.reference.modulated_frequency(self.reference.frequency(self.filtered_speed))
+            wraps = self.reference.phase.numpy() + cadence.numpy() * self.dt >= 1
             done = settled & wraps
             steps = self._cycle_steps[done]
             mean_error = self._cycle_error_sums[done] / steps
@@ -665,6 +697,9 @@ class SprintEnv(SprintRobot):
         commands = self.commands.copy()
         commands[:, 0] = self.filtered_speed
         terms["commands"] = commands
+        if self.cfg.reference.phase_obs and not critic:
+            angle = 2 * np.pi * self.reference.phase.numpy()
+            terms["phase"] = np.column_stack((np.sin(angle), np.cos(angle)))
         if self.cfg.control.residual_obs and not critic:
             terms["residual"] = self.residual_dynamics.applied / self.residual_limits
         if critic:

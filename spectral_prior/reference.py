@@ -15,6 +15,7 @@ class ReferenceGenerator:
         self.indices = np.array([list(joint_names).index(n) for n in JOINT_NAMES])
         self.default = torch.as_tensor(default_pose, dtype=torch.float32)
         self.phase = torch.zeros(num_envs)
+        self.phase_rate_scale = None
         self.blend_speed = blend_speed
         if blend_speed <= 0:
             raise ValueError("blend_speed must be positive")
@@ -34,23 +35,31 @@ class ReferenceGenerator:
 
     def reset(self, ids):
         self.phase[torch.as_tensor(ids)] = 0
+        if self.phase_rate_scale is not None:
+            self.phase_rate_scale[torch.as_tensor(ids)] = 1
+
+    def modulated_frequency(self, frequency):
+        if self.phase_rate_scale is None:
+            return frequency
+        return frequency * self.phase_rate_scale
 
     def advance(self, speed, dt):
         if dt < 0:
             raise ValueError("dt must be nonnegative")
-        self.phase = (self.phase + self.frequency(speed) * dt) % 1
+        self.phase = (self.phase + self.modulated_frequency(self.frequency(speed)) * dt) % 1
 
     @torch.no_grad()
     def evaluate(self, speed, *, time_offset=0.0):
         speed = torch.as_tensor(speed, dtype=torch.float32)
         f = self.frequency(speed)
-        phase = self.phase if time_offset == 0 else (self.phase + f * time_offset) % 1
+        cadence = self.modulated_frequency(f)
+        phase = self.phase if time_offset == 0 else (self.phase + cadence * time_offset) % 1
         generated = self.prior(phase, f, sample=False)[0]
         weight = (speed / self.blend_speed).clamp(0, 1)
         weight = weight.square() * (3 - 2 * weight)
         reference = self.default.expand(len(speed), -1).clone()
         reference[:, self.indices] = torch.lerp(self.default[self.indices], generated, weight[:, None])
-        return reference.numpy(), f.numpy()
+        return reference.numpy(), cadence.numpy()
 
     def evaluate_with_velocity(self, speed, dt):
         """Phase velocity at the current command; residual actions remain position offsets."""

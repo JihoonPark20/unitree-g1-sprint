@@ -1,6 +1,7 @@
 """rsl-rl PPO plus spectral-prior identity and environment checkpoint contracts."""
 
 import io
+import math
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -53,6 +54,13 @@ class SprintRunner(LeggedOnPolicyRunner):
         except BaseException:
             print(setup.getvalue(), end="")
             raise
+        if env.cfg.control.learned_leak:
+            initial = env.cfg.control.residual_leak - env.cfg.control.lambda_min
+            bias = initial + math.log(-math.expm1(-initial))
+            head = self.alg.actor.mlp[-1]
+            with torch.no_grad():
+                head.weight[-1].zero_()
+                head.bias[-1].fill_(bias)
         self.logger = TrainingLogger(
             log_dir=log_dir, cfg=self.cfg, env_cfg=env.cfg, num_envs=env.num_envs,
             is_distributed=self.is_distributed, gpu_world_size=self.gpu_world_size,
@@ -74,6 +82,15 @@ class SprintRunner(LeggedOnPolicyRunner):
             "observation": "angular_gravity_filtered_commands_q_dq_previous_residual",
             "critic_extra": "base_linear_velocity_reference_10",
         }
+        if self.env.auxiliary_actions:
+            contract["auxiliary_actions"] = self.env.auxiliary_actions
+        if self.env.cfg.reference.phase_modulation:
+            contract["phase_modulation"] = self.env.cfg.reference.phase_modulation
+        if self.env.cfg.reference.phase_obs:
+            contract["phase_obs"] = True
+        if self.env.cfg.control.learned_leak:
+            contract["lambda_min"] = self.env.cfg.control.lambda_min
+            contract["residual_leak_initial"] = self.env.cfg.control.residual_leak
         if self.env.cfg.control.increment_kappa is not None:
             contract["increment_kappa"] = self.env.cfg.control.increment_kappa
             contract["increment_mode"] = self.env.cfg.control.residual_mode

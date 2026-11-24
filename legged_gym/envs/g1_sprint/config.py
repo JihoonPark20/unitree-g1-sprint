@@ -11,6 +11,8 @@ class SprintCfg(G1FlatCfg):
 
     class reference:
         checkpoint = str(DEFAULT_PRIOR)
+        phase_modulation = 0.0
+        phase_obs = False
         blend_speed = 0.4
         # Eq.11: compare q and q_ref at the same instant (post-step state vs reference at t+dt).
         prior_reward_time_aligned = True
@@ -33,6 +35,8 @@ class SprintCfg(G1FlatCfg):
         # Interpolate the held target along dq_ref over the 200 Hz substeps, so zero residual
         # tracks q_ref(t+dt) instead of lagging it. SPRINT does not publish a PD target rule.
         reference_lookahead = True
+        learned_leak = False
+        lambda_min = 0.0
         residual_mode = "position"
         residual_leak = 0.0
         residual_feedforward = 0.0

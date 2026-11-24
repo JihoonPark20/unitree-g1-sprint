@@ -148,3 +148,19 @@ the same action units as A0. Each PPO transition stores the clean previous mean
 alongside its observations. The actor clears that history on episode reset.
 Deterministic playback applies the clean mean directly. Both C1 arms use the
 experiment grid `increment_kappa` ∈ {0.1, 0.2, 0.4}.
+
+### Phase modulation and learned leak
+
+`reference.phase_obs=True` adds the sine and cosine of the current oscillator
+phase to the actor. With `reference.phase_modulation=0.1`, append one scalar
+phase action after the joint actions. It multiplies the current phase rate by
+`1 + 0.1 * tanh(action)`. The spectral prior retains its speed-conditioned
+waveform. Phase advance, substep target timing and reward timing use the new
+cadence.
+
+With `control.learned_leak=True`, append a scalar leak action last. Its rate
+in s⁻¹ is `control.lambda_min + softplus(action)`. The scalar and joint
+commands undergo the same input delay. Set the initial `residual_leak` above
+`lambda_min` (default 0). The decoder initializes the leak channel to that
+rate for every observation. Joint observations, bounds and controller metrics
+continue to use 23 physical joints.

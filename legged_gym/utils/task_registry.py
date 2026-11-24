@@ -181,12 +181,15 @@ class TaskRegistry:
                     raise ValueError("Checkpoint belongs to a different task")
                 if snapshot["env"]["asset"]["file"] != env_cfg.asset.file:
                     raise ValueError("Checkpoint snapshot belongs to a different robot/configuration")
+                joint_count = len(env_cfg.asset.action_joint_names)
+                aux_count = (int(bool(snapshot["env"]["reference"].get("phase_modulation")))
+                             + int(bool(snapshot["env"]["control"].get("learned_leak"))))
                 if (
-                    snapshot["env"]["env"]["num_actions"] != env_cfg.env.num_actions
+                    snapshot["env"]["env"]["num_actions"] != joint_count + aux_count
                     or snapshot["env"]["asset"].get("action_joint_names") != env_cfg.asset.action_joint_names
                 ):
                     raise ValueError(
-                        "Checkpoint action joints do not match the wrist-held policy (23 actions). "
+                        "Checkpoint action layout does not match the wrist-held policy and configured auxiliary controls. "
                         "Old 29-action checkpoints cannot be resumed or played with this configuration. "
                         "Start a new training run without --resume or --checkpoint_path."
                     )

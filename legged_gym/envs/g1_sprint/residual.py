@@ -29,16 +29,24 @@ class ResidualDynamics:
         self.state[ids] = self.applied[ids] = self.rate[ids] = 0
         self.blocked[ids] = False
 
-    def advance(self, command, reference, velocity, sim, *, first):
+    def advance(self, command, reference, velocity, sim, *, first, leak=None):
         if self.mode == "position":
             if first:
                 self.rate[:] = (command - self.applied) / self.policy_dt
                 self.applied[:] = command
             return
 
-        gain = -np.expm1(-self.leak * self.dt) / self.leak if self.leak else self.dt
-        drive = self.leak * command if self.mode == "lowpass" else command
-        proposed = self.state + gain * (drive - self.leak * self.state)
+        if leak is None:
+            gain = -np.expm1(-self.leak * self.dt) / self.leak if self.leak else self.dt
+            drive = self.leak * command if self.mode == "lowpass" else command
+            proposed = self.state + gain * (drive - self.leak * self.state)
+        else:
+            blend = -np.expm1(-leak * self.dt)
+            if self.mode == "lowpass":
+                proposed = self.state + blend * (command - self.state)
+            else:
+                gain = np.divide(blend, leak, out=np.full_like(leak, self.dt), where=leak > 0)
+                proposed = (1 - blend) * self.state + gain * command
         bounded = np.clip(proposed, -self.limit, self.limit)
         increment = bounded - self.state
         mix_weight = 1 - self.mix
