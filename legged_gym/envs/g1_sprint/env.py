@@ -9,6 +9,7 @@ import torch
 from legged_gym.envs.base.legged_robot import SprintRobot, rotate_inverse
 from legged_gym.envs.curriculums import GridAdaptiveCurriculum
 from legged_gym.envs.g1_sprint.calibration import kinematic_speed_calibration
+from legged_gym.envs.g1_sprint.residual import ResidualDynamics
 from legged_gym.sim.mujoco_batch import joint_parameters, load_model
 from spectral_prior.reference import ReferenceGenerator
 
@@ -44,6 +45,8 @@ class SprintEnv(SprintRobot):
             "Gait/signed_foot_separation_m", "Gait/feet_crossed_fraction",
             "Posture/roll_rad", "Posture/roll_abs_rad",
         )
+        if cfg.control.residual_mode != "position":
+            self._diagnostic_names += ("Control/anti_windup_fraction",)
         self._diagnostic_sums = np.zeros((cfg.env.num_envs, len(self._diagnostic_names)))
         self._joint_residual_sums = np.zeros((cfg.env.num_envs, 3, len(cfg.asset.action_joint_names)))
         self._torque_saturation_sums = np.zeros((cfg.env.num_envs, len(cfg.asset.joint_names)))
@@ -62,6 +65,23 @@ class SprintEnv(SprintRobot):
         self._target_interp = getattr(cfg.control, "target_interp", None)
         if self._target_interp not in (None, "zoh", "linear", "exact"):
             raise ValueError("target_interp must be None, zoh, linear, or exact")
+        mode = cfg.control.residual_mode
+        leak, ff, mix = cfg.control.residual_leak, cfg.control.residual_feedforward, cfg.control.residual_mix_direct
+        if mode not in ("position", "lowpass", "integrator"):
+            raise ValueError("residual_mode must be position, lowpass, or integrator")
+        if not np.isfinite([leak, ff, mix]).all() or leak < 0 or ff < 0 or not 0 <= mix <= 1:
+            raise ValueError("Residual leak and feedforward must be nonnegative and direct mix in [0, 1]")
+        if mode == "lowpass" and leak <= 0:
+            raise ValueError("Lowpass residual dynamics require a positive leak")
+        if mix and mode != "lowpass":
+            raise ValueError("Direct position mixing requires a lowpass target in radians")
+        self._uses_residual_state = mode != "position" or ff != 0 or cfg.control.residual_obs
+        self.residual_dynamics = None
+        if self._uses_residual_state:
+            if self.residual_limits is None:
+                raise ValueError("Residual state requires per-joint residual_limits")
+            if self._target_interp is None and (mode != "position" or ff):
+                self._target_interp = "linear" if cfg.control.reference_lookahead else "zoh"
         self._legacy_lookahead = self._target_interp is None and getattr(cfg.control, "reference_lookahead", False)
         self._substep_history = None
         self.q_ref = np.tile(default, (cfg.env.num_envs, 1))
@@ -123,6 +143,10 @@ class SprintEnv(SprintRobot):
 
     def reset_idx(self, ids):
         super().reset_idx(ids)
+        if self._uses_residual_state:
+            if self.residual_dynamics is None:
+                self.residual_dynamics = ResidualDynamics(self)
+            self.residual_dynamics.reset(ids)
         self._diagnostic_sums[ids] = 0
         self._joint_residual_sums[ids] = 0
         self._torque_saturation_sums[ids] = 0
@@ -200,6 +224,10 @@ class SprintEnv(SprintRobot):
         self.target_position[:, self.action_dof_indices] += residual
         self.target_position[:, self.held_dof_indices] = self.default_dof_pos[self.held_dof_indices]
         self.target_velocity[:] = velocity
+        if self.cfg.control.residual_feedforward:
+            self.target_velocity[:, self.action_dof_indices] += (
+                self.cfg.control.residual_feedforward * self.residual_dynamics.rate
+            )
         self.target_velocity[:, self.held_dof_indices] = 0
         lower, upper = limits.T
         outside = (self.target_position < lower) | (self.target_position > upper)
@@ -207,6 +235,12 @@ class SprintEnv(SprintRobot):
         self.target_velocity[((self.target_position <= lower) & (self.target_velocity < 0))
                              | ((self.target_position >= upper) & (self.target_velocity > 0))] = 0
         np.clip(self.target_position, lower, upper, out=self.target_position)
+
+    def _record_applied_residual(self, offset, count):
+        square = np.square(offset)
+        self._joint_residual_sums[:, 0] += square / count
+        self._joint_residual_sums[:, 1] += (np.abs(offset) >= 0.99 * self.residual_limits) / count
+        self._diagnostic_sums[:, 0] += np.sqrt(square.mean(1)) / count
 
     def check_termination(self):
         super().check_termination()
@@ -284,7 +318,7 @@ class SprintEnv(SprintRobot):
         if actions.shape != self.actions.shape or not np.isfinite(actions).all():
             raise ValueError(f"Expected finite residual actions of shape {self.actions.shape}")
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
-        if self.residual_limits is not None:
+        if self.residual_limits is not None and self.cfg.control.residual_mode != "integrator":
             action_limits = self.residual_limits / self.cfg.control.action_scale
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
         # Previous-action observations describe the bounded residual actually
@@ -294,10 +328,11 @@ class SprintEnv(SprintRobot):
         bound = self.cfg.control.action_scale * self.cfg.control.clip_actions
         if self.residual_limits is not None:
             bound = np.minimum(bound, self.residual_limits)
-        self._joint_residual_sums[:, 0] += np.square(residual)
-        self._joint_residual_sums[:, 1] += np.abs(residual) >= 0.99 * bound
+        if self.residual_dynamics is None:
+            self._joint_residual_sums[:, 0] += np.square(residual)
+            self._joint_residual_sums[:, 1] += np.abs(residual) >= 0.99 * bound
+            self._diagnostic_sums[:, 0] += np.sqrt(np.square(residual).mean(1))
         self._joint_residual_sums[:, 2] += clipped
-        self._diagnostic_sums[:, 0] += np.sqrt(np.square(residual).mean(1))
         self._diagnostic_sums[:, 1] += clipped.mean(1)
         limits = self.sim.model.jnt_range[self.sim.joint_ids]
         packet = None
@@ -308,13 +343,16 @@ class SprintEnv(SprintRobot):
             self._diagnostic_sums[:, 2] += ((target < limits[:, 0]) | (target > limits[:, 1])).mean(1)
         else:
             packet = self._issue_substep_targets(residual)
+        if packet is None and (self.record_evaluation or self.residual_dynamics is not None):
+            eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
+            if self.residual_dynamics is not None:
+                self.residual_dynamics.applied[:] = eval_residual
+                self._record_applied_residual(eval_residual, 1)
         if self.record_evaluation:
             if self._last_eval_reference is None:
                 self._last_eval_reference = np.full_like(self.q_ref, np.nan)
                 self._last_eval_offset = np.full_like(self.q_ref, np.nan)
-            if packet is None:
-                eval_ref, eval_velocity, eval_residual = self._evaluation_inputs(residual, limits)
-            else:
+            if packet is not None:
                 eval_residual = packet[2]
             shape = (self.cfg.control.decimation, *self.torques.shape)
             trace = {
@@ -338,7 +376,20 @@ class SprintEnv(SprintRobot):
             self._lookahead_s = (substep + 1) * self.cfg.sim.dt
             if packet is not None:
                 reference = packet[0][:, substep]
-                self._apply_substep_target(reference, packet[1][:, substep], packet[2], limits)
+                velocity = packet[1][:, substep]
+                offset = packet[2]
+                dynamics = self.residual_dynamics
+                if dynamics is not None:
+                    dynamics.advance(packet[2], reference, velocity, self.sim, first=substep == 0)
+                    offset = dynamics.applied
+                    count = self.cfg.control.decimation
+                    self._record_applied_residual(offset, count)
+                    if dynamics.mode != "position":
+                        self._diagnostic_sums[:, -1] += dynamics.blocked.mean(1) / count
+                    if self.record_evaluation:
+                        trace["residual"][substep] = offset
+                        trace["anti_windup"][substep] = dynamics.blocked
+                self._apply_substep_target(reference, velocity, offset, limits)
             self.torques[:] = self._compute_torques(self.actions)
             if self.record_evaluation or self.record_failure_trace:
                 joint_velocity = self.sim.qvel[:, self.sim.qvel_ids]
@@ -437,7 +488,9 @@ class SprintEnv(SprintRobot):
                     "phase": self.reference.phase.numpy().copy(),
                     "frequency_hz": self.frequency.copy(),
                     "forward_velocity": extras["evaluation"]["forward_velocity"].copy(),
-                    "issued_residual_rad": residual.copy(),
+                    ("issued_residual_rate_rad_s" if self.cfg.control.residual_mode == "integrator"
+                     else "issued_residual_rad"): residual.copy(),
+                    "applied_residual_rad": trace["residual"][-1].copy(),
                     "joint_pos_rad": self.dof_pos[:, self.action_dof_indices].copy(),
                     "pd_target_rad": self._pd_target[:, self.action_dof_indices].copy(),
                     "joint_velocity_rad_s": self.dof_vel[:, self.action_dof_indices].copy(),
@@ -599,6 +652,8 @@ class SprintEnv(SprintRobot):
         commands = self.commands.copy()
         commands[:, 0] = self.filtered_speed
         terms["commands"] = commands
+        if self.cfg.control.residual_obs and not critic:
+            terms["residual"] = self.residual_dynamics.applied / self.residual_limits
         if critic:
             terms["reference"] = self.q_ref[:, self.reference.indices]
         return terms

@@ -105,3 +105,28 @@ Explicit `linear` extrapolates the issued reference at the same four offsets
 before adding the residual and enforcing joint limits. `exact` evaluates the
 frozen prior at each offset and uses a 5 ms centered difference there for the
 velocity target. A delayed command retains its original reference and residual.
+
+### Residual dynamics
+
+Set `control.residual_mode` to `position` (the default), `lowpass`, or
+`integrator`. In position and lowpass modes, `action_scale * action` commands
+a joint offset in radians. In integrator mode it commands rad/s. The integrator
+uses `residual_leak` in s⁻¹, including zero for a pure integrator. A lowpass
+controller requires a positive leak and approaches the commanded offset with
+time constant `1 / residual_leak`.
+
+The controller updates the state every 5 ms. It limits stored offsets to
+`residual_limits` and restricts each outward increment to the available joint
+range and PD torque. An increment toward the interior can proceed while the
+opposite direction is saturated. Each episode starts with zero residual and
+empty input history. A delayed controller consumes the reference, its velocity
+and the residual command from the same policy tick.
+
+`control.residual_obs=True` appends the applied offset divided by the joint's
+residual limit to the actor observation. `residual_feedforward` multiplies
+the realized residual velocity in the D target. For a filtered state this
+uses the accepted 5 ms increment. For an absolute position command it uses
+the difference between successive delayed commands over the 20 ms policy
+period. `residual_mix_direct` sets the fraction of a lowpass target applied
+directly alongside the filtered state. Its direct jump is excluded from
+the velocity target.

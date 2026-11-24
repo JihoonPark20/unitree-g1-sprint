@@ -33,6 +33,11 @@ class SprintCfg(G1FlatCfg):
         # Interpolate the held target along dq_ref over the 200 Hz substeps, so zero residual
         # tracks q_ref(t+dt) instead of lagging it. SPRINT does not publish a PD target rule.
         reference_lookahead = True
+        residual_mode = "position"
+        residual_leak = 0.0
+        residual_feedforward = 0.0
+        residual_obs = False
+        residual_mix_direct = 0.0
         target_interp = None  # Inherit the checkpoint's reference_lookahead rule.
         # MJCF actuator ctrlrange; the inherited 25 Nm default under-limited ankles and waist roll/pitch.
         effort_limits = {**G1FlatCfg.control.effort_limits, ".*_ankle_.*": 50.0, "waist_(roll|pitch)_joint": 50.0}
