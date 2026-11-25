@@ -10,6 +10,7 @@ class ResidualDynamics:
         self.leak = cfg.residual_leak
         self.mix = cfg.residual_mix_direct
         self.ff = cfg.residual_feedforward
+        self.limits_only = getattr(cfg, "frozen_limits_only", False)
         self.dt = env.cfg.sim.dt
         self.policy_dt = env.dt
         self.indices = env.action_dof_indices
@@ -50,6 +51,14 @@ class ResidualDynamics:
         bounded = np.clip(proposed, -self.limit, self.limit)
         increment = bounded - self.state
         mix_weight = 1 - self.mix
+        accepted = increment if self.limits_only else self._project(increment, command, reference, velocity, sim)
+        self.blocked[:] = (bounded != proposed) | (accepted != increment)
+        self.state += accepted
+        self.applied[:] = mix_weight * self.state + self.mix * command
+        self.rate[:] = mix_weight * accepted / self.dt
+
+    def _project(self, increment, command, reference, velocity, sim):
+        mix_weight = 1 - self.mix
         base_offset = mix_weight * self.state + self.mix * command
         target = reference[:, self.indices] + base_offset
         base_torque = (self.kp * (target - sim.qpos[:, self.qids])
@@ -63,10 +72,41 @@ class ResidualDynamics:
         if mix_weight > 0:
             lower = np.minimum(0, np.maximum((self.lower - target) / mix_weight, tau_lo))
             upper = np.maximum(0, np.minimum((self.upper - target) / mix_weight, tau_hi))
-            accepted = np.clip(increment, lower, upper)
+            return np.clip(increment, lower, upper)
+        return increment
+
+
+class HeldLowpass(ResidualDynamics):
+    """Use one exact low-pass update and one anti-windup decision per policy tick."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        if self.mode != "lowpass" or self.ff:
+            raise ValueError("The policy-rate comparator requires lowpass and zero feedforward")
+        self.dt = self.policy_dt
+
+    def advance(self, command, reference, velocity, sim, *, first, leak=None):
+        if first:
+            super().advance(command, reference, velocity, sim, first=True, leak=leak)
         else:
-            accepted = increment
-        self.blocked[:] = (bounded != proposed) | (accepted != increment)
-        self.state += accepted
-        self.applied[:] = mix_weight * self.state + self.mix * command
-        self.rate[:] = mix_weight * accepted / self.dt
+            self.blocked.fill(False)
+            self.rate.fill(0)
+
+
+class ResidualRamp(ResidualDynamics):
+    """Integrate a constant rate from the accepted offset to each absolute command."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        if self.mode != "integrator" or self.leak or self.ff or self.mix:
+            raise ValueError("The ramp comparator requires pure integration and zero feedforward")
+        self.command_rate = np.zeros_like(self.state)
+
+    def reset(self, ids):
+        super().reset(ids)
+        self.command_rate[ids] = 0
+
+    def advance(self, command, reference, velocity, sim, *, first, leak=None):
+        if first:
+            self.command_rate[:] = (command - self.state) / self.policy_dt
+        super().advance(self.command_rate, reference, velocity, sim, first=first)

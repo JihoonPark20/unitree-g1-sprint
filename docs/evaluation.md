@@ -92,3 +92,62 @@ require the registered trial protocol, training seeds, matching prior and PPO
 settings, and selected conditions. Retention requires every matched seed to
 be no worse. Mixed observations without a decisive adverse difference leave
 retention inconclusive.
+
+### Compare residual controllers on one frozen policy
+
+Use the same checkpoint, commands, trial seeds and initial conditions in each
+call. The deterministic policy reads each simulated state in closed loop.
+The diagnostic first loads the checkpoint with its saved policy contract. It
+then builds a separate evaluation environment with the requested controller.
+
+```bash
+sprint-evaluate --checkpoint_path /path/to/model.pt --speeds 4 --warmup-seconds 8 --frozen-target linear \
+  --frozen-residual position --output /tmp/frozen-position.json
+sprint-evaluate --checkpoint_path /path/to/model.pt --speeds 4 --warmup-seconds 8 --frozen-target linear \
+  --frozen-residual lowpass --frozen-cutoff-hz 10 --output /tmp/frozen-lowpass.json
+```
+
+| Diagnostic option | Applied controller |
+|---|---|
+| `--frozen-residual position` | Hold the absolute residual issued by the policy. |
+| `--frozen-residual ramp` | Move toward the absolute command at constant velocity over one policy interval, subject to the controller limits. |
+| `--frozen-residual lowpass --frozen-cutoff-hz HZ` | Advance the first-order residual state every physics substep. |
+| `--frozen-residual lowpass-hold --frozen-cutoff-hz HZ` | Advance the first-order residual state once per policy interval and hold the result across physics substeps. |
+| `--frozen-feedforward` | Add the realized residual velocity to the PD velocity target in position or lowpass mode. |
+| `--frozen-start reset\|measurement` | Apply the diagnostic at reset (default) or after direct linear control through warmup. Measurement-start runs store the physical state, applied residual and recurrent-state fingerprints immediately before the switch. |
+| `--frozen-projection limits-only` | Keep the hard residual bound, PD target joint limits and actuator torque caps. Skip directional anti-windup inside the integrator for this diagnostic. The standard state projection is `directional`. |
+| `--frozen-target inherited\|linear\|exact` | Inherit the reference rule (default), use substep linear extrapolation, or sample the exact prior. |
+
+The checkpoint must supply absolute joint commands. The JSON has
+`kind=frozen_policy_diagnostic`, the checkpoint hash, the original and effective
+controller settings, and the residual update frequency. These evaluations can
+be compared within the frozen checkpoint. The trained-arm aggregator excludes
+them from training-seed cohorts.
+
+To compare two 4.0 m/s frozen-policy reports that use the explicit linear
+target, run the following command. Both reports must use matching initial
+conditions and checkpoint weights, eight environments, an eight-second warmup
+and a 20-second measurement.
+
+```bash
+python -m legged_gym.scripts.compare_frozen direct.json candidate.json --output pair.json
+```
+
+Use the 50 Hz hold report as the first argument to check a substep lowpass
+against its equal-cutoff control. The output gives matched reset-seed blocks
+and the pooled measurements. The 4 m/s confirmation applies to the six
+held-out reset seeds 141–146 on one training checkpoint. Pilot and sensitivity
+seed sets receive descriptive endpoints. Welch high-band and total power
+use Nm² and average the six pitch joints. `E_hi` averages their individual
+power ratios.
+
+A measurement-start pair must also have matching warmup state fingerprints
+and the same active environments in each seed block. Compare identical filter modes and cutoffs to isolate a change in
+velocity feedforward or residual projection. A direct-position comparison can
+include both a filtered residual and feedforward or limits-only projection.
+The output labels the combined treatment. The direct position command has no
+continuous residual state to project. A cadence comparison requires the same
+cutoff, the same projection and zero velocity feedforward. Measurement-start,
+feedforward and limits-only comparisons are exploratory for the original
+confirmation rule. The original confirmation gate applies to
+reset-start trials using the ordinary directional projection.

@@ -1,6 +1,10 @@
 """Paper speed-grid evaluation with explicit trial coverage and aligned samples."""
 
+import hashlib
 import json
+import math
+from contextlib import ExitStack
+from copy import deepcopy
 from importlib.metadata import version
 from pathlib import Path
 
@@ -33,6 +37,103 @@ def aggregate_results(results):
     return output
 
 
+def frozen_environment(source, args):
+    from legged_gym.envs import task_registry
+
+    cfg = deepcopy(source.cfg)
+    if cfg.control.learned_leak or cfg.control.residual_mode == "integrator":
+        raise ValueError("The diagnostic requires policy joint outputs expressed as absolute position commands")
+    cfg.control.residual_mode = "position" if args.frozen_residual == "position" else "lowpass"
+    cfg.control.frozen_lowpass_hold = args.frozen_residual == "lowpass-hold"
+    if getattr(args, "frozen_projection", None) == "limits-only":
+        cfg.control.frozen_limits_only = True
+    cfg.control.frozen_residual_ramp = args.frozen_residual == "ramp"
+    if cfg.control.frozen_residual_ramp:
+        cfg.control.residual_mode = "integrator"
+        cfg.control.residual_leak = 0.
+    cfg.control.residual_mix_direct = 0.
+    cfg.control.increment_kappa = None
+    cfg.control.residual_feedforward = float(args.frozen_feedforward)
+    if args.frozen_cutoff_hz is not None:
+        cfg.control.residual_leak = math.tau * args.frozen_cutoff_hz
+    if args.frozen_target in ("linear", "exact"):
+        cfg.control.target_interp = args.frozen_target
+    env, _ = task_registry.make_env(args.task, args, cfg)
+    if (env.num_actions, env.num_obs, env.num_privileged_obs) != (
+            source.num_actions, source.num_obs, source.num_privileged_obs):
+        env.close()
+        raise ValueError("Frozen policy action, actor or critic dimensions differ from the checkpoint")
+    return env
+
+
+def frozen_controller(env):
+    from legged_gym.utils.helpers import class_to_dict
+
+    settings = class_to_dict(env.cfg.control)
+    held = settings.get("frozen_lowpass_hold", False)
+    mode = settings["residual_mode"]
+    if settings.get("frozen_residual_ramp"):
+        mode = "ramp"
+    elif held:
+        mode = "lowpass-hold"
+    settings.update(
+        effective_residual_mode=mode,
+        effective_target=env._target_interp or ("legacy_linear" if env._legacy_lookahead else "legacy_zoh"),
+        cutoff_hz=settings["residual_leak"] / math.tau if mode in ("lowpass", "lowpass-hold") else None,
+        residual_update_hz=1 / (env.dt if held or mode == "position" else env.cfg.sim.dt),
+        actor_obs=env.num_obs, critic_obs=env.num_privileged_obs, num_actions=env.num_actions,
+    )
+    return settings
+
+
+class MeasurementStart:
+    """Warm up on direct positions and initialize the treatment at the same physics boundary."""
+
+    def __init__(self, env, runner, args):
+        source = runner.env.cfg.control
+        if (not args.frozen_residual or args.frozen_target != "linear" or env._target_interp != "linear"
+                or args.warmup_seconds <= 0 or source.residual_mode != "position"
+                or source.residual_feedforward or source.residual_obs or not env._absolute_residual_input):
+            raise ValueError("Measurement start requires an absolute-position source without residual observations or "
+                             "feedforward, explicit linear targets and positive warmup")
+        self.env = env
+        self.dynamics = env.residual_dynamics
+        self.uses_state = env._uses_residual_state
+        self.feedforward = env.cfg.control.residual_feedforward
+
+    def warmup(self):
+        self.env._uses_residual_state = False
+        self.env.residual_dynamics = None
+        self.env.cfg.control.residual_feedforward = 0.
+
+    def restore(self):
+        self.env._uses_residual_state = self.uses_state
+        self.env.residual_dynamics = self.dynamics
+        self.env.cfg.control.residual_feedforward = self.feedforward
+
+    def activate(self, actor, active):
+        env = self.env
+        held = env._last_eval_offset[:, env.action_dof_indices].copy()
+        held[~active] = 0.
+        if not np.isfinite(held).all():
+            raise ValueError("Live environment has no finite last applied residual at measurement start")
+        self.restore()
+        if self.dynamics is not None:
+            self.dynamics.reset(np.arange(env.num_envs))
+            self.dynamics.state[:] = held
+            self.dynamics.applied[:] = held
+        hidden = actor.get_hidden_state()
+        hidden_hash = None
+        if hidden is not None:
+            states = (hidden,) if isinstance(hidden, torch.Tensor) else hidden
+            hidden_hash = hashlib.sha256(b"".join(t.detach().cpu().numpy().tobytes() for t in states)).hexdigest()
+        return dict(reached=True, active_env_indices=np.flatnonzero(active).tolist(), active_count=int(active.sum()),
+                    qpos_sha256=hashlib.sha256(env.sim.qpos.tobytes()).hexdigest(),
+                    qvel_sha256=hashlib.sha256(env.sim.qvel.tobytes()).hexdigest(), actor_hidden_sha256=hidden_hash,
+                    residual_sha256=hashlib.sha256(held.tobytes()).hexdigest(), residual_rad=held.tolist(),
+                    forward_speed_m_s=env.base_lin_vel[:, 0].tolist())
+
+
 def evaluate_policy(env, runner, args):
     failure_window = getattr(args, "failure_window", 0.0)
     if not np.isfinite(failure_window) or failure_window < 0:
@@ -42,6 +143,9 @@ def evaluate_policy(env, runner, args):
     warmup = int(np.ceil(args.warmup_seconds / env.dt))
     steps = int(np.ceil(args.seconds / env.dt))
     total = warmup + steps
+    start = getattr(args, "frozen_start", None) or "reset"
+    switch = MeasurementStart(env, runner, args) if start == "measurement" else None
+    switches = []
     # Also protect callers that construct an environment without make_playback.
     env.max_episode_length = total + 1
     env.cfg.commands.resampling_time = (total + 1) * env.dt
@@ -66,6 +170,8 @@ def evaluate_policy(env, runner, args):
                     env.rng = np.random.default_rng(seed)
                     torch.manual_seed(seed)
                     env.command_ranges[:] = [[speed, speed], [0, 0], [0, 0]]
+                    if switch:
+                        switch.warmup()
                     obs = env.reset()
                     runner.alg.actor.reset()
                     runner.alg.critic.reset()
@@ -83,7 +189,10 @@ def evaluate_policy(env, runner, args):
                     jump_rows = {key: [] for key in ("p_jump_reference", "p_jump_residual")}
                     jump_masks = []
                     q_rows, ref_rows, trace_rows = [], [], []
+                    boundary = None
                     for step in range(total):
+                        if switch and step == warmup:
+                            boundary = switch.activate(runner.alg.actor, active)
                         if step == warmup and impulse:
                             pushed[:] = active
                             direction = np.where((np.arange(env.num_envs) + seed) % 2, -1., 1.)
@@ -124,6 +233,10 @@ def evaluate_policy(env, runner, args):
                         runner.alg.critic.reset(dones.to(runner.device))
                         if not active.any():
                             break
+                    if switch:
+                        switches.append(dict(command_speed=speed, seed=seed, **(boundary or dict(
+                            reached=False, active_env_indices=[], active_count=0, qpos_sha256=None, qvel_sha256=None,
+                            actor_hidden_sha256=None, residual_sha256=None, residual_rad=None, forward_speed_m_s=None))))
                     q = np.concatenate(q_rows) if q_rows else np.empty((0, 10), dtype=np.float32)
                     reference = np.concatenate(ref_rows) if ref_rows else np.empty((0, 10), dtype=np.float32)
                     speed_q.append(q)
@@ -195,6 +308,8 @@ def evaluate_policy(env, runner, args):
                     flush=True,
                 )
     finally:
+        if switch:
+            switch.restore()
         env.record_evaluation = False
         env.record_failure_trace = False
         env.evaluation_latency_steps = None
@@ -276,6 +391,19 @@ def evaluate_policy(env, runner, args):
         "aggregate": aggregate,
         "results": results,
     }
+    if getattr(args, "frozen_residual", None):
+        report["kind"] = "frozen_policy_diagnostic"
+        report["protocol"]["default_protocol_settings"] = False
+        report["frozen_policy"] = {
+            "start": start, "switches": switches, "switch_forward_speed_frame": "body x",
+            "checkpoint_sha256": report["checkpoint_sha256"],
+            "source_controller": frozen_controller(runner.env),
+            "controller": frozen_controller(env),
+            "requested_mode": args.frozen_residual,
+            "requested_target": args.frozen_target or "inherited",
+            "projection": getattr(args, "frozen_projection", None) or "directional",
+            "control_contract_role": "original loaded checkpoint",
+        }
     write_report(report, output)
     print(f"Saved {output}; complete paper grid: {report['protocol']['paper_grid_complete']}")
     return report
@@ -290,16 +418,18 @@ def main(argv=None):
         args.speeds = [3.0]
         if args.warmup_seconds is None:
             args.warmup_seconds = 8.0
-    env, runner = make_playback(args, evaluation=True)
-    try:
+    with ExitStack() as resources:
+        env, runner = make_playback(args, evaluation=True)
+        resources.callback(env.close)
+        if args.frozen_residual:
+            env = frozen_environment(env, args)
+            resources.callback(env.close)
         if args.calibrate_push:
             from legged_gym.scripts.push_calibration import calibrate_push
 
             calibrate_push(env, runner, args, evaluate_policy)
         else:
             evaluate_policy(env, runner, args)
-    finally:
-        env.close()
 
 
 if __name__ == "__main__":

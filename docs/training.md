@@ -199,3 +199,21 @@ Use `--residual-scale VALUE` to set the physical action scale for an RMS-matched
 retraining. `--latency-steps {0,1,2}` sets a fixed training delay in policy
 ticks. Preserve the checkpoint's adjacent configuration and prior for playback.
 Older checkpoints retain their recorded control settings and receive the A0 arm label.
+
+### Choose a training horizon for high-speed comparisons
+
+Read the command curriculum and evaluation results from earlier runs with the
+same task, reward, prior, rollout length and number of environments. Record
+the first promotion out of the initial command range and the number of PPO
+updates required to survive at the intended speed. A flat command limit before
+the first promotion measures the time spent in the initial range. Use a
+checkpoint evaluation to establish what speeds the policy can sustain.
+
+For a low-cost controller check, start with a saved policy that survives the
+target command. Evaluate its existing controller and the intervention with
+the same weights, reference, commands and reset seeds using the frozen-policy
+options in `docs/evaluation.md`. Compare high-frequency torque only where both
+conditions meet the study's survival and observation requirements. To test
+learning with a new actor, use independent training seeds, matched rollout
+budgets and the same evaluation gate. If the budget buys only initial learning,
+report the high-speed trained-policy question as inconclusive.

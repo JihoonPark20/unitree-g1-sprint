@@ -9,7 +9,7 @@ import torch
 from legged_gym.envs.base.legged_robot import SprintRobot, rotate_inverse
 from legged_gym.envs.curriculums import GridAdaptiveCurriculum
 from legged_gym.envs.g1_sprint.calibration import kinematic_speed_calibration
-from legged_gym.envs.g1_sprint.residual import ResidualDynamics
+from legged_gym.envs.g1_sprint.residual import HeldLowpass, ResidualDynamics, ResidualRamp
 from legged_gym.sim.mujoco_batch import joint_parameters, load_model
 from spectral_prior.reference import ReferenceGenerator
 
@@ -79,6 +79,12 @@ class SprintEnv(SprintRobot):
         if self._target_interp not in (None, "zoh", "linear", "exact"):
             raise ValueError("target_interp must be None, zoh, linear, or exact")
         mode = cfg.control.residual_mode
+        self._absolute_residual_input = mode != "integrator" or getattr(cfg.control, "frozen_residual_ramp", False)
+        self._residual_type = ResidualDynamics
+        if getattr(cfg.control, "frozen_lowpass_hold", False):
+            self._residual_type = HeldLowpass
+        elif getattr(cfg.control, "frozen_residual_ramp", False):
+            self._residual_type = ResidualRamp
         leak, ff, mix = cfg.control.residual_leak, cfg.control.residual_feedforward, cfg.control.residual_mix_direct
         if mode not in ("position", "lowpass", "integrator"):
             raise ValueError("residual_mode must be position, lowpass, or integrator")
@@ -167,7 +173,7 @@ class SprintEnv(SprintRobot):
         super().reset_idx(ids)
         if self._uses_residual_state:
             if self.residual_dynamics is None:
-                self.residual_dynamics = ResidualDynamics(self)
+                self.residual_dynamics = self._residual_type(self)
             self.residual_dynamics.reset(ids)
         self._diagnostic_sums[ids] = 0
         self._joint_residual_sums[ids] = 0
@@ -357,7 +363,7 @@ class SprintEnv(SprintRobot):
                 leak = self.cfg.control.lambda_min + np.logaddexp(0, actions[:, -1:].astype(float))
             actions = actions[:, :joint_count]
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
-        if self.residual_limits is not None and self.cfg.control.residual_mode != "integrator":
+        if self.residual_limits is not None and self._absolute_residual_input:
             action_limits = self.residual_limits / self.cfg.control.action_scale
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
         if self._increment_action_limits is not None:
@@ -532,8 +538,7 @@ class SprintEnv(SprintRobot):
                     "phase": self.reference.phase.numpy().copy(),
                     "frequency_hz": self.frequency.copy(),
                     "forward_velocity": extras["evaluation"]["forward_velocity"].copy(),
-                    ("issued_residual_rate_rad_s" if self.cfg.control.residual_mode == "integrator"
-                     else "issued_residual_rad"): residual.copy(),
+                    ("issued_residual_rad" if self._absolute_residual_input else "issued_residual_rate_rad_s"): residual.copy(),
                     "applied_residual_rad": trace["residual"][-1].copy(),
                     "joint_pos_rad": self.dof_pos[:, self.action_dof_indices].copy(),
                     "pd_target_rad": self._pd_target[:, self.action_dof_indices].copy(),

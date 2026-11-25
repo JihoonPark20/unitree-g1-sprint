@@ -123,6 +123,8 @@ def load_run(root, row):
     try:
         r.path = root / row["evaluation"]
         report = read(r.path)
+        require(report.get("kind") != "frozen_policy_diagnostic" and "frozen_policy" not in report,
+                "frozen-policy diagnostic does not represent an independently trained arm")
         require(report["schema_version"] >= 3, "evaluation lacks controller samples")
         cfg_path = root / row["config"]
         cfg = read(cfg_path)
@@ -183,6 +185,8 @@ def discover(root):
         try:
             report = read(path)
             if not isinstance(report, dict) or not {"results", "speed_bins", "checkpoint"} <= report.keys():
+                continue
+            if report.get("kind") == "frozen_policy_diagnostic" or "frozen_policy" in report:
                 continue
             checkpoint = Path(report["checkpoint"])
             snapshot = checkpoint.parent / "run_config.json"

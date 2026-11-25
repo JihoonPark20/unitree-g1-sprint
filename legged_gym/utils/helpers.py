@@ -146,6 +146,16 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--camera-distance", type=float, default=3.0, help="Initial camera distance in meters")
         parser.add_argument("--camera-height", type=float, default=0.0, help="Look-at height relative to the pelvis")
     elif mode == "evaluate":
+        parser.add_argument("--frozen-residual", choices=("position", "lowpass", "lowpass-hold", "ramp"),
+                            help="Run a frozen policy under a diagnostic residual controller")
+        parser.add_argument("--frozen-cutoff-hz", type=float, help="Positive lowpass cutoff for the diagnostic")
+        parser.add_argument("--frozen-projection", choices=("directional", "limits-only"),
+                            help="Diagnostic state update: directional anti-windup or residual limits alone")
+        parser.add_argument("--frozen-feedforward", action="store_true", help="Use the realized residual velocity in PD")
+        parser.add_argument("--frozen-target", choices=("inherited", "linear", "exact"),
+                            help="Diagnostic reference interpolation (default: inherit checkpoint)")
+        parser.add_argument("--frozen-start", choices=("reset", "measurement"),
+                            help="Start the frozen controller at reset or after a direct-position warmup (default: reset)")
         parser.add_argument("--push-impulse", type=float, default=0, metavar="NS",
                             help="Single lateral pelvis impulse in N s at the first measured tick")
         parser.add_argument("--calibrate-push", action="store_true",
@@ -161,8 +171,29 @@ def get_args(argv=None, *, mode="train"):
     else:
         raise ValueError(f"Unknown mode: {mode}")
     args = parser.parse_args(argv)
+    if getattr(args, "frozen_projection", None) and args.frozen_residual not in ("lowpass", "lowpass-hold", "ramp"):
+        parser.error("--frozen-projection requires a frozen residual dynamics mode")
     if getattr(args, "warm_start", None) and (getattr(args, "resume", False) or args.checkpoint_path):
         parser.error("--warm_start starts a new run and cannot be combined with --resume or --checkpoint_path")
+    if mode == "evaluate":
+        if args.frozen_start is not None and args.frozen_residual is None:
+            parser.error("--frozen-start requires --frozen-residual")
+        if args.frozen_start == "measurement" and (
+                args.frozen_target != "linear" or args.warmup_seconds == 0):
+            parser.error("--frozen-start measurement requires --frozen-target linear and positive warmup")
+        if args.frozen_residual is None and (args.frozen_cutoff_hz is not None or args.frozen_feedforward
+                                             or args.frozen_target is not None):
+            parser.error("--frozen-target, --frozen-feedforward and --frozen-cutoff-hz require --frozen-residual")
+        if args.frozen_residual:
+            filtered = args.frozen_residual in ("lowpass", "lowpass-hold")
+            if filtered != (args.frozen_cutoff_hz is not None):
+                parser.error("--frozen-cutoff-hz belongs to lowpass and lowpass-hold and is required for both")
+            if filtered and (not math.isfinite(args.frozen_cutoff_hz) or args.frozen_cutoff_hz <= 0):
+                parser.error("--frozen-cutoff-hz must be finite and positive")
+            if args.frozen_residual in ("lowpass-hold", "ramp") and args.frozen_feedforward:
+                parser.error("lowpass-hold and ramp require zero residual velocity feedforward")
+            if args.calibrate_push:
+                parser.error("Push calibration requires the checkpoint controller")
     args.play = mode != "train"
     if args.play:
         args.resume = True
