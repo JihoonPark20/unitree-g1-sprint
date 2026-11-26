@@ -109,6 +109,14 @@ def get_args(argv=None, *, mode="train"):
     parser.add_argument("--load_run", default="-1")
     parser.add_argument("--checkpoint", type=int, default=-1)
     parser.add_argument("--experiment_name")
+    parser.add_argument("--torque-speed-envelope", choices=("on", "off"),
+                        help="Clip PD torque to the Unitree actuator torque-speed envelope (default: checkpoint or config)")
+    parser.add_argument("--actuator-friction", choices=("on", "off"),
+                        help="Subtract Unitree actuator static and viscous friction from PD torque")
+    parser.add_argument("--actuator-armature", choices=("on", "off"),
+                        help="Use each actuator's reflected inertia as joint armature")
+    parser.add_argument("--envelope-velocity-scale", type=float, metavar="S", help="Multiply every actuator x1, x2 by S")
+    parser.add_argument("--envelope-torque-scale", type=float, metavar="S", help="Multiply every actuator y1, y2 by S")
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (Viser during training)")
     if mode == "train":
         parser.add_argument("--max_iterations", "--max-iterations", type=int)
@@ -151,6 +159,10 @@ def get_args(argv=None, *, mode="train"):
     else:
         raise ValueError(f"Unknown mode: {mode}")
     args = parser.parse_args(argv)
+    for key in ("envelope_velocity_scale", "envelope_torque_scale"):
+        scale = getattr(args, key, None)
+        if scale is not None and not (math.isfinite(scale) and scale > 0):
+            parser.error(f"--{key.replace('_', '-')} must be finite and positive")
     if getattr(args, "warm_start", None) and (getattr(args, "resume", False) or args.checkpoint_path):
         parser.error("--warm_start starts a new run and cannot be combined with --resume or --checkpoint_path")
     args.play = mode != "train"
@@ -232,6 +244,12 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
             env_cfg.control.clip_actions = max(env_cfg.control.clip_actions, widest)
         if getattr(args, "curriculum_cycle_average", None):
             env_cfg.commands.curriculum_cycle_average = True
+        for key in ("torque_speed_envelope", "actuator_friction", "actuator_armature"):
+            if getattr(args, key, None) is not None:
+                setattr(env_cfg.control, key, getattr(args, key) == "on")
+        for key in ("envelope_velocity_scale", "envelope_torque_scale"):
+            if getattr(args, key, None) is not None:
+                setattr(env_cfg.control, key, getattr(args, key))
     if train_cfg is not None:
         for key in ("max_grad_norm", "desired_kl", "learning_rate"):
             value = getattr(args, key, None)

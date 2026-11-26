@@ -78,9 +78,15 @@ def load_model(cfg, *, fixed_base_height=None):
         for joint in list(pelvis):
             if joint.tag == "freejoint" or (joint.tag == "joint" and joint.get("type") == "free"):
                 pelvis.remove(joint)
+    armature = {}
+    if getattr(cfg.control, "actuator_armature", False):
+        from legged_gym.envs.g1_sprint.envelope import actuator_table
+
+        table = actuator_table(cfg.asset.joint_names, cfg.control.joint_actuators, cfg.control.actuator_models)
+        armature = dict(zip(cfg.asset.joint_names, table["armature"]))
     for joint in world.iter("joint"):
         joint.set("damping", "0")  # Damping is applied by task PD, exactly once.
-        joint.set("armature", str(cfg.control.armature))
+        joint.set("armature", str(armature.get(joint.get("name"), cfg.control.armature)))
         joint.set("frictionloss", str(cfg.control.frictionloss))
         # Vendor G1 joint force ranges differ from the training actuator limits.
         # The task's motor ctrlrange is the single source of torque saturation.

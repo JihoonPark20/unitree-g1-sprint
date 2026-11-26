@@ -73,6 +73,7 @@ def evaluate_policy(env, runner, args):
                     failure_times = [None] * env.num_envs
                     failure_trace = FailureTrace(env.num_envs, env.dt, failure_window) if failure_window else None
                     q_rows, ref_rows, trace_rows = [], [], []
+                    torque_rows = {key: [] for key in ("applied_torque", "requested_torque", "joint_velocity")}
                     for step in range(total):
                         obs, _, dones, extras = env.step(policy(obs.to(runner.device)))
                         sample = extras["evaluation"]  # t+dt, before automatic reset
@@ -92,6 +93,8 @@ def evaluate_policy(env, runner, args):
                             q_rows.append(q.astype(np.float32))
                             ref_rows.append(reference.astype(np.float32))
                             if args.save_trajectories:
+                                for key, rows in torque_rows.items():
+                                    rows.append(sample[key][:, ids].swapaxes(0, 1))
                                 trace_rows.append(
                                     np.column_stack((ids, np.full(len(ids), (step + 1) * env.dt), velocity))
                                 )
@@ -142,6 +145,10 @@ def evaluate_policy(env, runner, args):
                             forward_velocity=trace[:, 2],
                             command_speed=speed,
                             joint_names=np.array(JOINT_NAMES),
+                            control_joint_names=np.array(env.dof_names),
+                            **{key: np.concatenate(rows) if rows else
+                               np.empty((0, env.cfg.control.decimation, len(env.dof_names)))
+                               for key, rows in torque_rows.items()},
                         )
                 q, reference = np.concatenate(speed_q), np.concatenate(speed_ref)
                 pooled_q.append(q)
@@ -198,6 +205,10 @@ def evaluate_policy(env, runner, args):
             "control_dt": env.dt,
             "seeds": args.seeds,
             "trials_per_seed_speed": env.num_envs,
+            "torque_speed_envelope": None if env._envelope is None else {
+                "model": env.actuator_models, **{k: v.tolist() for k, v in zip(("y1", "y2", "x1", "x2"), env._envelope)}},
+            "actuator_friction": env._friction is not None,
+            "actuator_armature": bool(getattr(env.cfg.control, "actuator_armature", False)),
             "warmup_seconds": warmup * env.dt,
             "measurement_seconds": steps * env.dt,
             "initial_state": "environment reset distribution; fixed seed stream per command; LSTM and phase reset",

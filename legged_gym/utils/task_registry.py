@@ -29,6 +29,10 @@ from .helpers import (
 LOG_DIR = Path(LEGGED_GYM_ROOT_DIR) / "logs"
 
 
+# A saved policy may run on a different actuator model: evaluation and fine-tuning under it are the point.
+ACTUATOR_CONTRACT_KEYS = ("torque_speed_curve", "actuator_friction", "actuator_armature")
+
+
 def policy_contract(env):
     """Fields that must match when a saved policy is applied to this task."""
     contract = {
@@ -49,7 +53,7 @@ def policy_contract(env):
         "kp": env.p_gains.tolist(),
         "kd": env.d_gains.tolist(),
         "effort_limits": env.torque_limits.tolist(),
-        "torque_speed_curve": False,
+        "torque_speed_curve": getattr(env, "_envelope", None) is not None,
         "armature": env.cfg.control.armature,
         "frictionloss": env.cfg.control.frictionloss,
     }
@@ -134,7 +138,7 @@ class LeggedOnPolicyRunner(OnPolicyRunner):
         )
         if metadata is None or any(
             saved.get(key) != value and not (key in ("clip_actions", "residual_limits_rad") and widened(key, value))
-            for key, value in policy_contract(self.env).items()
+            for key, value in policy_contract(self.env).items() if key not in ACTUATOR_CONTRACT_KEYS
         ):
             raise ValueError("Checkpoint policy contract does not match this robot/configuration")
         del checkpoint
@@ -212,6 +216,8 @@ class TaskRegistry:
                 env_cfg.reference.prior_reward_time_aligned = snapshot["env"]["reference"].get(
                     "prior_reward_time_aligned", False)
                 env_cfg.control.reference_lookahead = snapshot["env"]["control"].get("reference_lookahead", False)
+                for key in ("torque_speed_envelope", "actuator_friction", "actuator_armature"):
+                    setattr(env_cfg.control, key, snapshot["env"]["control"].get(key, False))
                 env_cfg.rewards.air_height_swing_cap = snapshot["env"]["rewards"].get("air_height_swing_cap", False)
                 env_cfg.reference.speed_calibration = snapshot["env"]["reference"].get("speed_calibration")
                 if hasattr(train_cfg, "policy"):

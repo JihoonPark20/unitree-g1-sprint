@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from legged_gym.utils.task_registry import LeggedOnPolicyRunner, policy_contract, runner_config
+from legged_gym.utils.task_registry import ACTUATOR_CONTRACT_KEYS, LeggedOnPolicyRunner, policy_contract, runner_config
 from legged_gym.utils.training_logger import TrainingLogger
 from spectral_prior import JOINT_NAMES
 from spectral_prior.data import sha256
@@ -76,7 +76,11 @@ class SprintRunner(LeggedOnPolicyRunner):
         """
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         metadata = checkpoint.get("infos") or {}
-        if metadata.get("sprint") != self.sprint_contract() or metadata.get("legged_gym", {}).get("contract") != policy_contract(self.env):
+        def policy(contract):
+            return {k: v for k, v in (contract or {}).items() if k not in ACTUATOR_CONTRACT_KEYS}
+
+        if (metadata.get("sprint") != self.sprint_contract()
+                or policy(metadata.get("legged_gym", {}).get("contract")) != policy(policy_contract(self.env))):
             raise ValueError("Warm start requires matching robot, action bounds, observations, controller and spectral prior")
         source = dict(checkpoint["actor_state_dict"])
         for key, value in self.alg.actor.state_dict().items():

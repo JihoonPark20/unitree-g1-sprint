@@ -26,6 +26,38 @@ sprint-train --warm_start "<model>.pt" --rl_device auto --num_envs 4096 --num_th
 
 `--warm_start` transfers the actor's mean policy and uses the new training settings. Critic, optimizer, exploration, iteration counter and curriculum start fresh. The robot, controller, action bounds and spectral prior must match. This is an optional starting point, not a guarantee of faster convergence. Use `--resume` only to continue an existing compatible run with its saved settings.
 
+## Unitree actuator model
+
+Three switches, all off by default, apply the actuator model that Unitree
+publishes in `unitree_rl_lab` (`assets/robots/unitree_actuators.py`).
+
+| Setting | Effect |
+| --- | --- |
+| `torque_speed_envelope` | Clip PD torque at every physics step. Driving torque (same sign as joint velocity) is limited to `y1`, braking torque to `y2`. Both are flat up to `x1` and fall linearly to zero at `x2`. The effort limit stays an outer bound. `Control/torque_saturation` counts samples at 99% of this envelope. |
+| `actuator_friction` | Subtract `fs * tanh(v / 0.01) + fd * v` after clipping. |
+| `actuator_armature` | Use each actuator's reflected inertia instead of the uniform `armature`. |
+
+| Actuator | Joints | `y1` / `y2` (Nm) | `x1` / `x2` (rad/s) | `fs` (Nm), `fd` (Nm s/rad) | armature (kg m²) |
+| --- | --- | --- | --- | --- | --- |
+| N7520-14.3 | hip pitch, hip yaw, waist yaw | 71 / 83.3 | 22.63 / 35.52 | 1.6, 0.16 | 0.0102 |
+| N7520-22.5 | hip roll, knee | 111 / 131 | 14.5 / 22.7 | 2.4, 0.24 | 0.0251 |
+| N5020-16 | shoulder, elbow, wrist roll | 24.8 / 31.9 | 30.86 / 40.13 | 0.6, 0.06 | 0.0036 |
+| N5020-16x2 | ankle, waist roll/pitch | 49.6 / 63.8 | 30.86 / 40.13 | 1.2, 0.12 | 0.0072 |
+| W4010-25 | wrist pitch, wrist yaw | 4.8 / 8.6 | 15.3 / 24.76 | 0.6, 0.06 | 0.0043 |
+
+`actuator_models` holds this table and `joint_actuators` maps joints to it by
+regex. N5020-16x2 approximates the ankle and waist roll/pitch linkages as two
+N5020-16 in parallel, as Unitree's G1 config does for effort and armature.
+Some G1 builds use N7520-22.5 for hip pitch; change `joint_actuators` for those.
+`envelope_velocity_scale` multiplies `x1` and `x2`; `envelope_torque_scale`
+multiplies `y1` and `y2`.
+
+`--torque-speed-envelope`, `--actuator-friction`, `--actuator-armature`
+(`on|off`), `--envelope-velocity-scale` and `--envelope-torque-scale` override
+these settings in training and evaluation. Checkpoints saved without them load
+with all three off, and a saved policy may be evaluated, resumed or warm-started
+under any actuator model.
+
 ## Rewards
 
 [SPRINT’s reward terms and 13 published weights](https://arxiv.org/html/2605.28549v1#S3.SS3) are retained. Unpublished scales are tuned from a [RuN](https://arxiv.org/html/2509.20696v1#S3.SS3)-informed starting point:
