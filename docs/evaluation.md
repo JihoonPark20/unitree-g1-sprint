@@ -33,6 +33,23 @@ Defaults: **61 forward commands from 0 to 6 m/s**, spaced by 0.1 m/s; zero later
 | `FID_joint` | Fréchet distance between actual and reference joint-angle distributions |
 | Survival | Fraction of trials completed without failure |
 
-A fall ends the trial; automatic resets do not replace failed samples. Incomplete trials produce `null` full aggregate scores and separate observed-only diagnostics. Check survival and `paper_grid_complete` alongside errors. Saved reports include settings and checkpoint hashes; `--save-trajectories` also exports NPZ traces.
+A fall ends the trial; automatic resets do not replace failed samples. Incomplete trials produce `null` full aggregate scores and separate observed-only diagnostics. Check survival and `paper_grid_complete` alongside errors. Saved reports include settings and checkpoint hashes; `--save-trajectories` also exports NPZ traces. Loading rejects a checkpoint whose policy contract names settings this code does not know, because those settings would otherwise be dropped silently.
 
 Use `--speeds`, `--seconds`, `--warmup-seconds`, `--seeds` and `--num_envs` for shorter checks. Compare policies using identical settings. The metrics follow [SPRINT Eqs. 15–19](https://arxiv.org/html/2605.28549v1#S4.SS1), but use this project's MuJoCo protocol. `FID_joint` uses raw joint angles and is not established as numerically comparable to the paper’s FID.
+
+### Operating region
+
+```bash
+sprint-evaluate --checkpoint_path "<model>.pt" --torque-speed-envelope on --save-trajectories --output run.json
+python -m legged_gym.scripts.operating_region run.json --output region.json
+```
+
+Trajectory NPZ files also hold `applied_torque`, `requested_torque` (PD before
+clipping) and `joint_velocity` with axes [policy sample, physics substep, joint].
+For each joint the tool reports the actuator, `x1`, `x2`, speed percentiles, the
+time above `x1` and `x2`, applied torque outside the envelope and requested
+torque beyond it. It scores against the envelope recorded in the report
+(`protocol.torque_speed_envelope`), or the configured one when the run had it
+off. `--envelope-velocity-scale` and `--envelope-torque-scale` re-score the same
+trajectories under a scaled envelope. With friction on, applied torque can sit
+slightly outside the envelope because friction is subtracted after clipping.

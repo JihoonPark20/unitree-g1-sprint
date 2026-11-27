@@ -9,6 +9,7 @@ import torch
 from legged_gym.envs.base.legged_robot import SprintRobot, rotate_inverse
 from legged_gym.envs.curriculums import GridAdaptiveCurriculum
 from legged_gym.envs.g1_sprint.calibration import kinematic_speed_calibration
+from legged_gym.envs.g1_sprint.envelope import actuator_table, envelope_bounds, friction
 from legged_gym.sim.mujoco_batch import joint_parameters, load_model
 from spectral_prior.reference import ReferenceGenerator
 
@@ -28,6 +29,16 @@ class SprintEnv(SprintRobot):
         self.residual_limits = None if bounds is None else joint_parameters(cfg.asset.action_joint_names, bounds)
         if self.residual_limits is not None and np.any(self.residual_limits <= 0):
             raise ValueError("Residual joint limits must be positive radians")
+        high = getattr(cfg.control, "residual_limits_high", None)
+        self.residual_limits_high = None if high is None else joint_parameters(cfg.asset.action_joint_names, high)
+        self.residual_schedule = getattr(cfg.control, "residual_schedule", None)
+        if self.residual_limits_high is not None and (
+            self.residual_limits is None or np.any(self.residual_limits_high < self.residual_limits)
+            or self.residual_schedule is None or not 0 <= self.residual_schedule[0] < self.residual_schedule[1]
+            or np.any(self.residual_limits_high / cfg.control.action_scale > cfg.control.clip_actions + 1e-9)
+        ):
+            raise ValueError("residual_limits_high needs residual_limits <= high <= action_scale*clip_actions "
+                             "and a schedule [v0, v1] with 0 <= v0 < v1")
         self._terminate_on_feet_crossing = getattr(cfg.termination, "terminate_on_feet_crossing", False)
         if self._terminate_on_feet_crossing and (
             not np.isfinite([cfg.termination.feet_crossing_margin, cfg.termination.feet_crossing_duration_s]).all()
@@ -100,8 +111,20 @@ class SprintEnv(SprintRobot):
         self._command_cycle_steps = np.zeros(cfg.env.num_envs, dtype=int)
         self.record_evaluation = False
         self.record_failure_trace = False
+        self._envelope = self._friction = None
         super().__init__(cfg, **kwargs)
         self._foot_quat = self.sim.batch.bind("xquat")
+        control = cfg.control
+        if getattr(control, "torque_speed_envelope", False) or getattr(control, "actuator_friction", False):
+            table = actuator_table(self.dof_names, control.joint_actuators, control.actuator_models)
+            self.actuator_models = table["model"]
+            if control.torque_speed_envelope:
+                v, t = control.envelope_velocity_scale, control.envelope_torque_scale
+                if not (np.isfinite([v, t]).all() and v > 0 and t > 0):
+                    raise ValueError("Envelope scales must be finite and positive")
+                self._envelope = (table["y1"] * t, table["y2"] * t, table["x1"] * v, table["x2"] * v)
+            if getattr(control, "actuator_friction", False):
+                self._friction = (table["fs"], table["fd"])
 
     def _update_reference(self):
         if getattr(self.cfg.control, "reference_velocity", False):
@@ -153,7 +176,25 @@ class SprintEnv(SprintRobot):
             target = np.clip(target + self.target_velocity * self._lookahead_s, limits[:, 0], limits[:, 1])
         self._pd_target = target
         torque = self.p_gains * (target - pos) + self.d_gains * (self.target_velocity - vel)
-        return np.clip(torque, -self.torque_limits, self.torque_limits)
+        self._requested_torque = torque
+        lo, hi = -self.torque_limits, self.torque_limits
+        if self._envelope is not None:
+            lo, hi = envelope_bounds(*self._envelope, vel)
+            # The MuJoCo ctrlrange keeps the effort limit as an outer bound.
+            lo, hi = np.maximum(lo, -self.torque_limits), np.minimum(hi, self.torque_limits)
+        self._saturated = (torque >= 0.99 * hi) | (torque <= 0.99 * lo)
+        torque = np.clip(torque, lo, hi)
+        if self._friction is not None:
+            torque = torque - friction(*self._friction, vel)
+        return torque
+
+    def _current_residual_limits(self):
+        """Per-joint bounds, or per-env bounds rising with the filtered command under a speed schedule."""
+        if self.residual_limits_high is None:
+            return self.residual_limits
+        v0, v1 = self.residual_schedule
+        w = np.clip((np.abs(self.filtered_speed) - v0) / (v1 - v0), 0, 1)[:, None]
+        return self.residual_limits + w * (self.residual_limits_high - self.residual_limits)
 
     def step(self, actions):
         if self._closed:
@@ -164,16 +205,17 @@ class SprintEnv(SprintRobot):
         if actions.shape != self.actions.shape or not np.isfinite(actions).all():
             raise ValueError(f"Expected finite residual actions of shape {self.actions.shape}")
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
-        if self.residual_limits is not None:
-            action_limits = self.residual_limits / self.cfg.control.action_scale
+        residual_limits = self._current_residual_limits()
+        if residual_limits is not None:
+            action_limits = residual_limits / self.cfg.control.action_scale
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
         # Previous-action observations describe the bounded residual actually
         # requested from PD, while PPO retains its original sampled actions.
         residual = self.cfg.control.action_scale * self.actions
         clipped = np.abs(actions - self.actions) > 1e-7
         bound = self.cfg.control.action_scale * self.cfg.control.clip_actions
-        if self.residual_limits is not None:
-            bound = np.minimum(bound, self.residual_limits)
+        if residual_limits is not None:
+            bound = np.minimum(bound, residual_limits)
         self._joint_residual_sums[:, 0] += np.square(residual)
         self._joint_residual_sums[:, 1] += np.abs(residual) >= 0.99 * bound
         self._joint_residual_sums[:, 2] += clipped
@@ -201,18 +243,23 @@ class SprintEnv(SprintRobot):
         if self.record_failure_trace:
             step_saturation = np.zeros_like(self.torques)
             step_torque_peak = np.zeros_like(self.torques)
+        if self.record_evaluation:
+            substeps = {key: np.empty((self.cfg.control.decimation, *self.torques.shape))
+                        for key in ("applied_torque", "requested_torque", "joint_velocity")}
         for substep in range(self.cfg.control.decimation):
             self._lookahead_s = (substep + 1) * self.cfg.sim.dt
             self.torques[:] = self._compute_torques(self.actions)
+            if self.record_evaluation:
+                substeps["applied_torque"][substep] = self.torques
+                substeps["requested_torque"][substep] = self._requested_torque
+                substeps["joint_velocity"][substep] = self.sim.qvel[:, self.sim.qvel_ids]
             if self.record_failure_trace:
                 p_torque = self.p_gains * (self._pd_target - self.sim.qpos[:, self.sim.qpos_ids])
                 d_torque = self.d_gains * (self.target_velocity - self.sim.qvel[:, self.sim.qvel_ids])
                 requested_torque = p_torque + d_torque
-                step_saturation += (np.abs(self.torques) >= 0.99 * self.torque_limits) / self.cfg.control.decimation
+                step_saturation += self._saturated / self.cfg.control.decimation
                 np.maximum(step_torque_peak, np.abs(self.torques), out=step_torque_peak)
-            self._torque_saturation_sums += (
-                np.abs(self.torques) >= 0.99 * self.torque_limits
-            ) / self.cfg.control.decimation
+            self._torque_saturation_sums += self._saturated / self.cfg.control.decimation
             self.sim.step(self.torques, observe=substep == self.cfg.control.decimation - 1)
             self._update_contacts()
         self.common_step_counter += 1
@@ -253,6 +300,7 @@ class SprintEnv(SprintRobot):
                 "joint_pos": self.dof_pos[:, self.reference.indices].copy(),
                 "reference_joint_pos": self.q_ref[:, self.reference.indices].copy(),
                 "forward_velocity": (np.cos(yaw) * self.sim.qvel[:, 0] + np.sin(yaw) * self.sim.qvel[:, 1]).copy(),
+                **substeps,
             }
             if self.record_failure_trace:
                 gravity = self.projected_gravity

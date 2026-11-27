@@ -26,6 +26,38 @@ sprint-train --warm_start "<model>.pt" --rl_device auto --num_envs 4096 --num_th
 
 `--warm_start` transfers the actor's mean policy and uses the new training settings. Critic, optimizer, exploration, iteration counter and curriculum start fresh. The robot, controller, action bounds and spectral prior must match. This is an optional starting point, not a guarantee of faster convergence. Use `--resume` only to continue an existing compatible run with its saved settings.
 
+## Unitree actuator model
+
+Three switches, all off by default, apply the actuator model that Unitree
+publishes in `unitree_rl_lab` (`assets/robots/unitree_actuators.py`).
+
+| Setting | Effect |
+| --- | --- |
+| `torque_speed_envelope` | Clip PD torque at every physics step. Driving torque (same sign as joint velocity) is limited to `y1`, braking torque to `y2`. Both are flat up to `x1` and fall linearly to zero at `x2`. The effort limit stays an outer bound. `Control/torque_saturation` counts samples at 99% of this envelope. |
+| `actuator_friction` | Subtract `fs * tanh(v / 0.01) + fd * v` after clipping. |
+| `actuator_armature` | Use each actuator's reflected inertia instead of the uniform `armature`. |
+
+| Actuator | Joints | `y1` / `y2` (Nm) | `x1` / `x2` (rad/s) | `fs` (Nm), `fd` (Nm s/rad) | armature (kg m²) |
+| --- | --- | --- | --- | --- | --- |
+| N7520-14.3 | hip pitch, hip yaw, waist yaw | 71 / 83.3 | 22.63 / 35.52 | 1.6, 0.16 | 0.0102 |
+| N7520-22.5 | hip roll, knee | 111 / 131 | 14.5 / 22.7 | 2.4, 0.24 | 0.0251 |
+| N5020-16 | shoulder, elbow, wrist roll | 24.8 / 31.9 | 30.86 / 40.13 | 0.6, 0.06 | 0.0036 |
+| N5020-16x2 | ankle, waist roll/pitch | 49.6 / 63.8 | 30.86 / 40.13 | 1.2, 0.12 | 0.0072 |
+| W4010-25 | wrist pitch, wrist yaw | 4.8 / 8.6 | 15.3 / 24.76 | 0.6, 0.06 | 0.0043 |
+
+`actuator_models` holds this table and `joint_actuators` maps joints to it by
+regex. N5020-16x2 approximates the ankle and waist roll/pitch linkages as two
+N5020-16 in parallel, as Unitree's G1 config does for effort and armature.
+Some G1 builds use N7520-22.5 for hip pitch; change `joint_actuators` for those.
+`envelope_velocity_scale` multiplies `x1` and `x2`; `envelope_torque_scale`
+multiplies `y1` and `y2`.
+
+`--torque-speed-envelope`, `--actuator-friction`, `--actuator-armature`
+(`on|off`), `--envelope-velocity-scale` and `--envelope-torque-scale` override
+these settings in training and evaluation. Checkpoints saved without them load
+with all three off, and a saved policy may be evaluated, resumed or warm-started
+under any actuator model.
+
 ## Rewards
 
 [SPRINT’s reward terms and 13 published weights](https://arxiv.org/html/2605.28549v1#S3.SS3) are retained. Unpublished scales are tuned from a [RuN](https://arxiv.org/html/2509.20696v1#S3.SS3)-informed starting point:
@@ -64,7 +96,9 @@ The [RLvRL-based curriculum](../legged_gym/envs/curriculums/grid_adaptive.py) ex
 
 Yaw tracking reward remains active at a zero target, with its weight and kernel unchanged. Yaw score/error do not gate forward promotion in this experiment. Zero yaw command does not physically lock rotation: inspect yaw error and trajectory heading alongside speed, because forward velocity is measured in the robot's heading frame. This configuration does not train turning or backward locomotion. The prior takes phase and speed-derived frequency, not a turn command.
 
-`Commands/*` shows command distribution and prior activation; `Curriculum/*` shows coverage and tracking success. If expansion stalls, inspect tracking scores, episode duration and reward contributions. A wider command range alone does not demonstrate successful locomotion.
+`Commands/*` shows command distribution and prior activation; `Curriculum/*` shows coverage and tracking success. A single success opens a neighbor partly, so with thousands of parallel segments cells open long before they are mastered. `Curriculum/frontier_success_rate` is the recent success rate of the fastest open cell and `Curriculum/mastered_command` the fastest cell with at least 20 recent segments and a 50% recent success rate, over roughly each cell's last 100 segments; both are printed on the console. If expansion stalls, inspect these, episode duration and reward contributions. A wider command range alone does not demonstrate successful locomotion.
+
+`--initial-command-range LO HI` sets the forward range the curriculum starts with, for example when a warm-started actor can already run. A warm start may switch between `g1_sprint` and `g1_sprint_paper_map` (speed calibration on or off); a resume may not.
 
 `Control/*` reports residual size and clipping; `TorqueSaturation/*` reports each joint's fraction of physics steps at ≥99% of its torque limit. For each policy-controlled joint, `ResidualRMS/*` reports bounded residual RMS in radians, `ResidualLimitFraction/*` reports time at ≥99% of the effective residual limit, and `ActionClipFraction/*` reports the fraction of requested actions clipped. These are measured before joint-position clipping; held wrists are excluded. `Tracking/*` reports prior, forward and yaw errors. `Gait/*` reports support fractions, signed foot separation and crossed-foot time fraction. `Episode/feet_crossing_fraction` reports the fraction of completed episodes terminated by persistent crossing. Inspect these alongside speed and survival; diagnostics use actual episode durations, including failed episodes.
 

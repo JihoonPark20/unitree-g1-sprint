@@ -35,11 +35,36 @@ class SprintCfg(G1FlatCfg):
         reference_lookahead = True
         # MJCF actuator ctrlrange; the inherited 25 Nm default under-limited ankles and waist roll/pitch.
         effort_limits = {**G1FlatCfg.control.effort_limits, ".*_ankle_.*": 50.0, "waist_(roll|pitch)_joint": 50.0}
+        # Unitree actuator model (docs/training.md), off by default. Values from unitree_rl_lab
+        # assets/robots/unitree_actuators.py; "x2" is two N5020-16 in parallel.
+        torque_speed_envelope = False
+        actuator_friction = False
+        actuator_armature = False  # Replace the uniform armature with each actuator's reflected inertia.
+        actuator_models = {
+            "N7520-14.3": {"y1": 71.0, "y2": 83.3, "x1": 22.63, "x2": 35.52, "fs": 1.6, "fd": 0.16, "armature": 0.01017752},
+            "N7520-22.5": {"y1": 111.0, "y2": 131.0, "x1": 14.5, "x2": 22.7, "fs": 2.4, "fd": 0.24, "armature": 0.025101925},
+            "N5020-16": {"y1": 24.8, "y2": 31.9, "x1": 30.86, "x2": 40.13, "fs": 0.6, "fd": 0.06, "armature": 0.003609725},
+            "N5020-16x2": {"y1": 49.6, "y2": 63.8, "x1": 30.86, "x2": 40.13, "fs": 1.2, "fd": 0.12, "armature": 0.00721945},
+            "W4010-25": {"y1": 4.8, "y2": 8.6, "x1": 15.3, "x2": 24.76, "fs": 0.6, "fd": 0.06, "armature": 0.00425},
+        }
+        joint_actuators = {
+            ".*_hip_(pitch|yaw)_joint": "N7520-14.3", "waist_yaw_joint": "N7520-14.3",
+            ".*_hip_roll_joint": "N7520-22.5", ".*_knee_joint": "N7520-22.5",
+            ".*_(shoulder_pitch|shoulder_roll|shoulder_yaw|elbow|wrist_roll)_joint": "N5020-16",
+            ".*_ankle_(pitch|roll)_joint": "N5020-16x2", "waist_(roll|pitch)_joint": "N5020-16x2",
+            ".*_wrist_(pitch|yaw)_joint": "W4010-25",
+        }
+        envelope_velocity_scale = 1.0  # Multiplies x1 and x2, for sensitivity sweeps.
+        envelope_torque_scale = 1.0  # Multiplies y1 and y2.
         action_scale = 0.25
         clip_actions = 2.0
         # Physical residual bounds, in radians, around the prior/default pose.
         # Shoulder roll/yaw are outside the ten-joint motion prior.
         residual_limits = {".*": 0.5, ".*_shoulder_(roll|yaw)_joint": 0.15}
+        # Optional speed schedule (CLI --residual-limits-high / --residual-schedule): bounds rise linearly from
+        # residual_limits to residual_limits_high as the filtered command goes from schedule[0] to schedule[1] m/s.
+        residual_limits_high = None
+        residual_schedule = None
         max_latency_steps = 0  # Enable latency randomization after basic gait validation.
 
     class domain_rand(G1FlatCfg.domain_rand):
