@@ -10,6 +10,8 @@ The environment owns segment duration, acceleration and termination handling.
 
 import numpy as np
 
+RECENT_DECAY = 0.99  # Per-cell exponential window over roughly the last 100 segments.
+
 
 class GridAdaptiveCurriculum:
     def __init__(self, limits, bin_widths, initial_ranges, thresholds, increment=0.2, local_range=None, progress=None,
@@ -60,6 +62,8 @@ class GridAdaptiveCurriculum:
         self.trials = np.zeros(len(active), dtype=np.int64)
         self.successes = np.zeros(len(active), dtype=np.int64)
         self.score_sums = np.zeros((len(active), 2))
+        self.recent_trials = np.zeros(len(active))
+        self.recent_successes = np.zeros(len(active))
         # Optional extra practice inside a forward-speed band: {"range": [lo, hi], "fraction": f}.
         # Not part of RLvRL; promotion rules are unchanged and the band is used only once its cells are active.
         self.focus = None if focus is None else {"range": [float(x) for x in focus["range"]], "fraction": float(focus["fraction"])}
@@ -117,6 +121,10 @@ class GridAdaptiveCurriculum:
         np.add.at(self.score_sums, bins, scores)
         successful = eligible & (scores >= self.thresholds).all(1)
         np.add.at(self.successes, bins[successful], 1)
+        new = np.bincount(bins, minlength=len(self.weights))
+        decay = RECENT_DECAY ** new
+        self.recent_trials = self.recent_trials * decay + new
+        self.recent_successes = self.recent_successes * decay + np.bincount(bins[successful], minlength=len(self.weights))
         passed = np.unique(bins[successful])
         if len(passed):
             neighbors = (np.abs(self.centers[:, None] - self.centers[passed]) <= self.local_range + 1e-12).all(2).any(1)
@@ -131,7 +139,14 @@ class GridAdaptiveCurriculum:
         active = self.weights > 0
         attempts = self.trials.sum()
         mean = self.score_sums.sum(0) / max(1, attempts)
+        # Recent success rates: cumulative counts hide a frontier opened by rare successes.
+        rate = self.recent_successes / np.maximum(self.recent_trials, 1e-9)
+        top = np.flatnonzero(active)[np.argmax(self.centers[active, 0])]
+        mastered = active & (self.recent_trials >= 20) & (rate >= 0.5)
         return {
+            "Curriculum/frontier_command": float(self.centers[top, 0]),
+            "Curriculum/frontier_success_rate": float(rate[top]),
+            "Curriculum/mastered_command": float(self.centers[mastered, 0].max()) if mastered.any() else 0.0,
             "Curriculum/active_fraction": float(active.mean()),
             "Curriculum/active_bins": int(active.sum()),
             "Curriculum/segment_success_fraction": float(self.successes.sum() / max(1, attempts)),

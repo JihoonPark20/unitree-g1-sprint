@@ -33,7 +33,7 @@ Defaults: **61 forward commands from 0 to 6 m/s**, spaced by 0.1 m/s; zero later
 | `FID_joint` | Fréchet distance between actual and reference joint-angle distributions |
 | Survival | Fraction of trials completed without failure |
 
-A fall ends the trial; automatic resets do not replace failed samples. Incomplete trials produce `null` full aggregate scores and separate observed-only diagnostics. Check survival and `paper_grid_complete` alongside errors. Saved reports include settings and checkpoint hashes; `--save-trajectories` also exports NPZ traces.
+A fall ends the trial; automatic resets do not replace failed samples. Incomplete trials produce `null` full aggregate scores and separate observed-only diagnostics. Check survival and `paper_grid_complete` alongside errors. Saved reports include settings and checkpoint hashes; `--save-trajectories` also exports NPZ traces. Loading rejects a checkpoint whose policy contract names settings this code does not know, because those settings would otherwise be dropped silently.
 
 Use `--speeds`, `--seconds`, `--warmup-seconds`, `--seeds` and `--num_envs` for shorter checks. Compare policies using identical settings. The metrics follow [SPRINT Eqs. 15–19](https://arxiv.org/html/2605.28549v1#S4.SS1), but use this project's MuJoCo protocol. `FID_joint` uses raw joint angles and is not established as numerically comparable to the paper’s FID.
 

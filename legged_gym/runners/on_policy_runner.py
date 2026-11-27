@@ -71,16 +71,24 @@ class SprintRunner(LeggedOnPolicyRunner):
     def warm_start(self, path):
         """Transfer an actor's mean policy under an identical control contract.
 
-        The new reward / curriculum may differ. Value function, optimizer,
+        The new reward / curriculum, actuator model and speed calibration may differ. Value function, optimizer,
         iteration counter and exploration parameters remain freshly initialized.
         """
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         metadata = checkpoint.get("infos") or {}
-        def policy(contract):
-            return {k: v for k, v in (contract or {}).items() if k not in ACTUATOR_CONTRACT_KEYS}
+        saved, current = metadata.get("legged_gym", {}).get("contract") or {}, policy_contract(self.env)
+        bounds = ("clip_actions", "residual_limits_rad")
 
-        if (metadata.get("sprint") != self.sprint_contract()
-                or policy(metadata.get("legged_gym", {}).get("contract")) != policy(policy_contract(self.env))):
+        def policy(contract):
+            # A warm start may also change how commands map onto the prior's speed labels, and widen residual bounds.
+            ignored = (*ACTUATOR_CONTRACT_KEYS, "prior_speed_calibration", *bounds,
+                       "residual_limits_high_rad", "residual_schedule_mps")
+            return {k: v for k, v in contract.items() if k not in ignored}
+
+        # Widening only: every action the saved actor issues still maps to the same PD target.
+        widened = all(k not in saved or (k in current and bool(torch.all(
+            torch.as_tensor(current[k]) >= torch.as_tensor(saved[k])))) for k in bounds)
+        if metadata.get("sprint") != self.sprint_contract() or policy(saved) != policy(current) or not widened:
             raise ValueError("Warm start requires matching robot, action bounds, observations, controller and spectral prior")
         source = dict(checkpoint["actor_state_dict"])
         for key, value in self.alg.actor.state_dict().items():

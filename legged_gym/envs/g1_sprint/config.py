@@ -61,6 +61,10 @@ class SprintCfg(G1FlatCfg):
         # Physical residual bounds, in radians, around the prior/default pose.
         # Shoulder roll/yaw are outside the ten-joint motion prior.
         residual_limits = {".*": 0.5, ".*_shoulder_(roll|yaw)_joint": 0.15}
+        # Optional speed schedule (CLI --residual-limits-high / --residual-schedule): bounds rise linearly from
+        # residual_limits to residual_limits_high as the filtered command goes from schedule[0] to schedule[1] m/s.
+        residual_limits_high = None
+        residual_schedule = None
         max_latency_steps = 0  # Enable latency randomization after basic gait validation.
 
     class domain_rand(G1FlatCfg.domain_rand):

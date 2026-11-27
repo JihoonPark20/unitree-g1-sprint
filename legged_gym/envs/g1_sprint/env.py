@@ -29,6 +29,16 @@ class SprintEnv(SprintRobot):
         self.residual_limits = None if bounds is None else joint_parameters(cfg.asset.action_joint_names, bounds)
         if self.residual_limits is not None and np.any(self.residual_limits <= 0):
             raise ValueError("Residual joint limits must be positive radians")
+        high = getattr(cfg.control, "residual_limits_high", None)
+        self.residual_limits_high = None if high is None else joint_parameters(cfg.asset.action_joint_names, high)
+        self.residual_schedule = getattr(cfg.control, "residual_schedule", None)
+        if self.residual_limits_high is not None and (
+            self.residual_limits is None or np.any(self.residual_limits_high < self.residual_limits)
+            or self.residual_schedule is None or not 0 <= self.residual_schedule[0] < self.residual_schedule[1]
+            or np.any(self.residual_limits_high / cfg.control.action_scale > cfg.control.clip_actions + 1e-9)
+        ):
+            raise ValueError("residual_limits_high needs residual_limits <= high <= action_scale*clip_actions "
+                             "and a schedule [v0, v1] with 0 <= v0 < v1")
         self._terminate_on_feet_crossing = getattr(cfg.termination, "terminate_on_feet_crossing", False)
         if self._terminate_on_feet_crossing and (
             not np.isfinite([cfg.termination.feet_crossing_margin, cfg.termination.feet_crossing_duration_s]).all()
@@ -178,6 +188,14 @@ class SprintEnv(SprintRobot):
             torque = torque - friction(*self._friction, vel)
         return torque
 
+    def _current_residual_limits(self):
+        """Per-joint bounds, or per-env bounds rising with the filtered command under a speed schedule."""
+        if self.residual_limits_high is None:
+            return self.residual_limits
+        v0, v1 = self.residual_schedule
+        w = np.clip((np.abs(self.filtered_speed) - v0) / (v1 - v0), 0, 1)[:, None]
+        return self.residual_limits + w * (self.residual_limits_high - self.residual_limits)
+
     def step(self, actions):
         if self._closed:
             raise RuntimeError("Environment is closed")
@@ -187,16 +205,17 @@ class SprintEnv(SprintRobot):
         if actions.shape != self.actions.shape or not np.isfinite(actions).all():
             raise ValueError(f"Expected finite residual actions of shape {self.actions.shape}")
         self.actions[:] = np.clip(actions, -self.cfg.control.clip_actions, self.cfg.control.clip_actions)
-        if self.residual_limits is not None:
-            action_limits = self.residual_limits / self.cfg.control.action_scale
+        residual_limits = self._current_residual_limits()
+        if residual_limits is not None:
+            action_limits = residual_limits / self.cfg.control.action_scale
             self.actions[:] = np.clip(self.actions, -action_limits, action_limits)
         # Previous-action observations describe the bounded residual actually
         # requested from PD, while PPO retains its original sampled actions.
         residual = self.cfg.control.action_scale * self.actions
         clipped = np.abs(actions - self.actions) > 1e-7
         bound = self.cfg.control.action_scale * self.cfg.control.clip_actions
-        if self.residual_limits is not None:
-            bound = np.minimum(bound, self.residual_limits)
+        if residual_limits is not None:
+            bound = np.minimum(bound, residual_limits)
         self._joint_residual_sums[:, 0] += np.square(residual)
         self._joint_residual_sums[:, 1] += np.abs(residual) >= 0.99 * bound
         self._joint_residual_sums[:, 2] += clipped

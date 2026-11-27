@@ -60,6 +60,9 @@ def policy_contract(env):
     if getattr(env, "residual_limits", None) is not None:
         contract["version"] = 3
         contract["residual_limits_rad"] = env.residual_limits.tolist()
+    if getattr(env, "residual_limits_high", None) is not None:
+        contract["residual_limits_high_rad"] = env.residual_limits_high.tolist()
+        contract["residual_schedule_mps"] = list(env.residual_schedule)
     if getattr(env.cfg.control, "reference_velocity", False):
         contract["reference_velocity"] = "phase_central_difference"
     if getattr(env.cfg.control, "reference_lookahead", False):
@@ -136,9 +139,18 @@ class LeggedOnPolicyRunner(OnPolicyRunner):
             saved.get(key) is not None and np.shape(saved[key]) == np.shape(value)
             and bool(np.all(np.asarray(value) >= np.asarray(saved[key])))
         )
+        current = policy_contract(self.env)
+        unsupported = sorted(set(saved) - set(current) - set(ACTUATOR_CONTRACT_KEYS))
+        if unsupported:
+            # Snapshot keys this code does not know are dropped from the config, so the policy would run under
+            # a different controller than it was trained with.
+            raise ValueError(f"Checkpoint was trained with settings this code does not support: {unsupported}")
+        # A new speed schedule only widens (high >= low is enforced by the env).
+        added_schedule = lambda key: key in ("residual_limits_high_rad", "residual_schedule_mps") and key not in saved
         if metadata is None or any(
-            saved.get(key) != value and not (key in ("clip_actions", "residual_limits_rad") and widened(key, value))
-            for key, value in policy_contract(self.env).items() if key not in ACTUATOR_CONTRACT_KEYS
+            saved.get(key) != value and not added_schedule(key)
+            and not (key in ("clip_actions", "residual_limits_rad", "residual_limits_high_rad") and widened(key, value))
+            for key, value in current.items() if key not in ACTUATOR_CONTRACT_KEYS
         ):
             raise ValueError("Checkpoint policy contract does not match this robot/configuration")
         del checkpoint

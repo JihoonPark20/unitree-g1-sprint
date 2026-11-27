@@ -122,7 +122,8 @@ class TrainingLogger(Logger):
         # Baseline rewards use the standard episode log; optional roll shaping
         # and detailed diagnostics remain in TensorBoard.
         for key, value in metrics.items():
-            if (key.startswith("Reward/") and key != "Reward/torso_roll") or key == "Curriculum/max_command_x":
+            if (key.startswith("Reward/") and key != "Reward/torso_roll") or key in (
+                    "Curriculum/max_command_x", "Curriculum/mastered_command", "Curriculum/frontier_success_rate"):
                 row(key, f"{value:.4f}")
         lines.append("-" * width)
         row("Iteration time", f"{iteration_time:.2f}s")

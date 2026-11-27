@@ -125,6 +125,8 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--learning_rate", type=float)
         parser.add_argument("--torso_roll_scale", "--torso-roll-scale", type=float,
                             help="Optional lateral posture penalty: nonpositive reward scale (default: 0)")
+        parser.add_argument("--initial-command-range", nargs=2, type=float, metavar=("LO", "HI"),
+                            help="Forward-speed range the command curriculum starts with (m/s)")
         parser.add_argument("--curriculum-focus", nargs=3, type=float, metavar=("LO", "HI", "FRACTION"),
                             help="Also sample this fraction of commands uniformly in [LO, HI] m/s once those cells are active (FRACTION 0: off)")
         parser.add_argument("--curriculum-cycle-average", action="store_true", default=None,
@@ -132,6 +134,11 @@ def get_args(argv=None, *, mode="train"):
         parser.add_argument("--residual-limits", type=json.loads, metavar="JSON",
                             help='Per-joint residual bounds in rad, regex -> value, later entries win, e.g. '
                                  '\'{".*": 0.5, ".*_knee_joint": 0.8}\'; replaces the configured/snapshot bounds')
+        parser.add_argument("--residual-limits-high", type=json.loads, metavar="JSON",
+                            help="Residual bounds reached at the top of --residual-schedule (same format as --residual-limits)")
+        parser.add_argument("--residual-schedule", nargs=2, type=float, metavar=("V0", "V1"),
+                            help="Filtered command speeds (m/s) over which bounds rise from --residual-limits to --residual-limits-high")
+        parser.add_argument("--prior-sigma", type=float, help="Override rewards.prior_sigma")
         parser.add_argument("--run_name")
         parser.add_argument("--log_interval", "--log-interval", type=int, default=1,
                             help="Terminal progress interval in iterations (default: 1); TensorBoard logs every iteration")
@@ -244,6 +251,15 @@ def update_cfg_from_args(env_cfg, train_cfg, args):
             env_cfg.control.clip_actions = max(env_cfg.control.clip_actions, widest)
         if getattr(args, "curriculum_cycle_average", None):
             env_cfg.commands.curriculum_cycle_average = True
+        if getattr(args, "residual_limits_high", None) is not None:
+            env_cfg.control.residual_limits_high = args.residual_limits_high
+            env_cfg.control.residual_schedule = list(args.residual_schedule or [])
+            widest = max(args.residual_limits_high.values()) / env_cfg.control.action_scale
+            env_cfg.control.clip_actions = max(env_cfg.control.clip_actions, widest)
+        if getattr(args, "prior_sigma", None) is not None:
+            env_cfg.rewards.prior_sigma = args.prior_sigma
+        if getattr(args, "initial_command_range", None) is not None:
+            env_cfg.commands.ranges = [list(args.initial_command_range), *env_cfg.commands.ranges[1:]]
         for key in ("torque_speed_envelope", "actuator_friction", "actuator_armature"):
             if getattr(args, key, None) is not None:
                 setattr(env_cfg.control, key, getattr(args, key) == "on")
